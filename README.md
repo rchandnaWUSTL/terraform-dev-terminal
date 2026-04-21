@@ -6,11 +6,19 @@ AI-native terminal REPL for HCP Terraform.
 
 ## Quick start
 
+Prerequisites:
+
+- Go 1.23+
+- [`hcptf`](https://github.com/thrashr888/hcptf-cli/releases) on your `PATH`
+- `ANTHROPIC_API_KEY` set in your environment
+
+Install:
+
 ```bash
 git clone https://github.com/rchandnaWUSTL/terraform-dev-terminal.git
 cd terraform-dev-terminal
-make install
-terraform-dev
+go build -o terraform-dev ./cmd/terraform-dev
+./terraform-dev --org=<your-org> --workspace=<your-workspace>
 ```
 
 ---
