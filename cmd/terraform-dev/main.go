@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/rchandnaWUSTL/terraform-dev/internal/config"
+	"github.com/rchandnaWUSTL/terraform-dev/internal/providerfactory"
 	"github.com/rchandnaWUSTL/terraform-dev/internal/repl"
 )
 
@@ -20,6 +22,7 @@ var (
 func main() {
 	org := flag.String("org", "", "HCP Terraform organization")
 	workspace := flag.String("workspace", "", "HCP Terraform workspace")
+	auth := flag.String("auth", "", "Auth backend: '' (default, use model_provider from config) or 'copilot'")
 	flag.Parse()
 
 	if err := runStartupChecks(); err != nil {
@@ -35,7 +38,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	r := repl.New(cfg, *org, *workspace)
+	authMode := providerfactory.AuthMode(*auth)
+	prov, err := providerfactory.New(cfg, authMode)
+	if err != nil {
+		fmt.Fprintln(os.Stderr)
+		red.Fprintf(os.Stderr, "  ✗ %v\n", err)
+		fmt.Fprintln(os.Stderr)
+		os.Exit(1)
+	}
+
+	if err := prov.Authenticate(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr)
+		red.Fprintf(os.Stderr, "  %v\n", err)
+		fmt.Fprintln(os.Stderr)
+		os.Exit(1)
+	}
+
+	cfg.Model = providerfactory.ModelFor(cfg, authMode)
+
+	r := repl.New(cfg, prov, *org, *workspace)
 	if err := r.Run(); err != nil {
 		red.Fprintf(os.Stderr, "  ✗ %v\n", err)
 		os.Exit(1)
@@ -45,10 +66,6 @@ func main() {
 func runStartupChecks() error {
 	if _, err := exec.LookPath("hcptf"); err != nil {
 		return fmt.Errorf("✗ hcptf not found. Install it and ensure it's on your PATH.\n    https://github.com/thrashr888/hcptf-cli/releases")
-	}
-
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		return fmt.Errorf("✗ ANTHROPIC_API_KEY not found in environment.\n    export ANTHROPIC_API_KEY=your-key")
 	}
 
 	if err := ensureHCPTFCredentials(); err != nil {

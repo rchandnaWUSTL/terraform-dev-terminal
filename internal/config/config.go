@@ -8,18 +8,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultAnthropicModel is the model string written to a fresh config.yaml. It
+// is also the sentinel the provider factory checks when deciding whether to
+// override to an OpenAI-compatible model under --auth=copilot.
+const DefaultAnthropicModel = "claude-sonnet-4-6"
+
 type Config struct {
 	Model          string `yaml:"model"`
 	MaxTokens      int    `yaml:"max_tokens"`
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 	Readonly       bool   `yaml:"readonly"`
+	ModelProvider  string `yaml:"model_provider"`
+	OpenAIBaseURL  string `yaml:"openai_base_url"`
 }
 
 var defaults = Config{
-	Model:          "claude-sonnet-4-6",
+	Model:          DefaultAnthropicModel,
 	MaxTokens:      16384,
 	TimeoutSeconds: 10,
 	Readonly:       true,
+	ModelProvider:  "anthropic",
 }
 
 func Load() (*Config, error) {

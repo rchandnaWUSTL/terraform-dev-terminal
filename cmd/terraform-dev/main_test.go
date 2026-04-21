@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/anthropic"
 )
 
 func TestStartupChecks_MissingHcptf(t *testing.T) {
@@ -21,15 +24,13 @@ func TestStartupChecks_MissingHcptf(t *testing.T) {
 	}
 }
 
-func TestStartupChecks_MissingAPIKey(t *testing.T) {
-	// Ensure hcptf is on PATH for this test
-	if _, err := exec.LookPath("hcptf"); err != nil {
-		t.Skip("hcptf not on PATH, skipping")
-	}
-
+func TestAnthropicProvider_MissingAPIKey(t *testing.T) {
+	// The Anthropic provider's Authenticate() now owns the ANTHROPIC_API_KEY
+	// check that previously lived in runStartupChecks. Verify the error is
+	// still user-friendly and actionable.
 	t.Setenv("ANTHROPIC_API_KEY", "")
-
-	err := runStartupChecks()
+	p := anthropic.New(anthropic.Options{})
+	err := p.Authenticate(context.Background())
 	if err == nil {
 		t.Fatal("expected error when ANTHROPIC_API_KEY missing")
 	}
@@ -43,12 +44,7 @@ func TestStartupChecks_NoCredentials(t *testing.T) {
 		t.Skip("hcptf not on PATH, skipping")
 	}
 
-	t.Setenv("ANTHROPIC_API_KEY", "test-key")
-	// Intentionally leave HCP credentials absent — hcptf whoami should fail.
-	// This test validates the credential check error path, not authentication itself.
 	err := checkHCPTFCredentials()
-	// If credentials happen to be present this test will pass vacuously.
-	// In CI without credentials, we expect an error.
 	if err != nil && !strings.Contains(err.Error(), "credentials") && !strings.Contains(err.Error(), "hcptf") {
 		t.Errorf("unexpected error format: %v", err)
 	}

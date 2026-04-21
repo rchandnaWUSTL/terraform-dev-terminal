@@ -5,45 +5,58 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chzyer/readline"
 	"github.com/fatih/color"
 	"github.com/rchandnaWUSTL/terraform-dev/internal/agent"
 	"github.com/rchandnaWUSTL/terraform-dev/internal/config"
+	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
 	"github.com/rchandnaWUSTL/terraform-dev/internal/tools"
 )
 
 var (
-	bold      = color.New(color.Bold)
-	cyan      = color.New(color.FgCyan)
-	green     = color.New(color.FgGreen)
-	red       = color.New(color.FgRed)
-	yellow    = color.New(color.FgYellow)
-	white     = color.New(color.FgWhite)
-	dimWhite  = color.New(color.FgWhite, color.Faint)
-	magenta   = color.New(color.FgMagenta, color.Bold)
-	boldWhite = color.New(color.FgWhite, color.Bold)
+	bold         = color.New(color.Bold)
+	cyan         = color.New(color.FgCyan)
+	green        = color.New(color.FgGreen)
+	red          = color.New(color.FgRed)
+	yellow       = color.New(color.FgYellow)
+	white        = color.New(color.FgWhite)
+	dimWhite     = color.New(color.FgWhite, color.Faint)
+	boldWhite    = color.New(color.FgWhite, color.Bold)
+	tfPurple     = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(99), color.Bold)  // HashiCorp Terraform #7B42BC
+	packerBlue   = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(39), color.Bold)  // HashiCorp Packer #02A8EF
+	waypointTeal = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(44))              // HashiCorp Waypoint #14C6CB
+	vaultYellow  = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(220))             // HashiCorp Vault #FFCF25
+	boundaryPink = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(203))             // HashiCorp Boundary #EC585D
 )
+
+var _ = vaultYellow // reserved for future warning paths
 
 type REPL struct {
 	cfg       *config.Config
 	ag        *agent.Agent
+	prov      provider.Provider
 	org       string
 	workspace string
 }
 
-func New(cfg *config.Config, org, workspace string) *REPL {
+func New(cfg *config.Config, prov provider.Provider, org, workspace string) *REPL {
 	return &REPL{
 		cfg:       cfg,
-		ag:        agent.New(cfg),
+		ag:        agent.New(cfg, prov),
+		prov:      prov,
 		org:       org,
 		workspace: workspace,
 	}
 }
 
 func (r *REPL) Run() error {
+	color.NoColor = false
 	printBanner(r.cfg)
 
 	rl, err := readline.NewEx(&readline.Config{
@@ -111,7 +124,7 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 			yellow.Println("mode: read-write")
 		}
 	default:
-		red.Printf("Unknown command: %s\n", parts[0])
+		boundaryPink.Printf("Unknown command: %s\n", parts[0])
 		fmt.Println("Type /help for available commands.")
 	}
 	return false
@@ -120,58 +133,136 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 func (r *REPL) ask(userMsg string) {
 	ctx := context.Background()
 
+	var sawToolResult atomic.Bool
+	var spin *toolSpinner
 	ch, err := r.ag.Ask(ctx, userMsg, r.org, r.workspace,
 		func(ev agent.ToolCallEvent) {
-			printToolCall(ev)
+			spin = startToolSpinner(ev)
 		},
 		func(name string, result *tools.CallResult) {
-			printToolResult(name, result)
+			if spin != nil {
+				spin.finish(name, result)
+				spin = nil
+			} else {
+				printToolResult(name, result)
+			}
+			sawToolResult.Store(true)
 		},
 	)
 	if err != nil {
-		red.Printf("Error: %v\n", err)
+		boundaryPink.Printf("Error: %v\n", err)
 		return
 	}
 
 	fmt.Println()
-	white.Print("  ")
+	var buf strings.Builder
+	firstLine := true
+	flushLine := func(line string) {
+		clean := stripMarkdown(line)
+		if clean == "" && firstLine {
+			return
+		}
+		if firstLine && sawToolResult.Load() {
+			fmt.Println()
+		}
+		white.Printf("  %s\n", clean)
+		firstLine = false
+	}
 	for chunk := range ch {
 		if chunk.Err != nil {
-			fmt.Println()
-			red.Printf("Error: %v\n", chunk.Err)
+			if buf.Len() > 0 {
+				flushLine(buf.String())
+				buf.Reset()
+			}
+			boundaryPink.Printf("Error: %v\n", chunk.Err)
 			return
 		}
 		if chunk.Done {
 			break
 		}
-		// Print inline, replacing newlines with newline + indent
-		text := strings.ReplaceAll(chunk.Text, "\n", "\n  ")
-		white.Print(text)
+		buf.WriteString(chunk.Text)
+		for {
+			s := buf.String()
+			idx := strings.IndexByte(s, '\n')
+			if idx < 0 {
+				break
+			}
+			flushLine(s[:idx])
+			buf.Reset()
+			buf.WriteString(s[idx+1:])
+		}
 	}
-	fmt.Print("\n\n")
+	if buf.Len() > 0 {
+		flushLine(buf.String())
+	}
+	fmt.Println()
 }
 
-func printToolCall(ev agent.ToolCallEvent) {
+var spinnerFrames = []string{"|", "/", "-", "\\"}
+
+type toolSpinner struct {
+	stop chan struct{}
+	done chan struct{}
+	name string
+	args string
+}
+
+func startToolSpinner(ev agent.ToolCallEvent) *toolSpinner {
 	argParts := make([]string, 0, len(ev.Args))
 	for k, v := range ev.Args {
 		argParts = append(argParts, fmt.Sprintf("%s=%s", k, v))
 	}
-	cyan.Printf("  ⟳ %s", ev.Name)
-	if len(argParts) > 0 {
-		dimWhite.Printf("  %s", strings.Join(argParts, " "))
+	s := &toolSpinner{
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+		name: ev.Name,
+		args: strings.Join(argParts, " "),
 	}
-	fmt.Println()
+	s.render(spinnerFrames[0])
+	go func() {
+		defer close(s.done)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-ticker.C:
+				i = (i + 1) % len(spinnerFrames)
+				s.render(spinnerFrames[i])
+			}
+		}
+	}()
+	return s
+}
+
+func (s *toolSpinner) render(frame string) {
+	fmt.Print("\r\033[2K  ")
+	tfPurple.Print(frame)
+	fmt.Print(" ")
+	tfPurple.Print(s.name)
+	if s.args != "" {
+		dimWhite.Printf("  %s", s.args)
+	}
+}
+
+func (s *toolSpinner) finish(name string, result *tools.CallResult) {
+	close(s.stop)
+	<-s.done
+	fmt.Print("\r\033[2K")
+	printToolResult(name, result)
 }
 
 func printToolResult(name string, result *tools.CallResult) {
 	duration := result.Duration.Round(time.Millisecond)
 	if result.Err != nil {
-		red.Printf("  ✗ %s (%s): %s\n", name, duration, result.Err.Message)
+		boundaryPink.Printf("  ✗ %s (%s): %s\n", name, duration, result.Err.Message)
 		return
 	}
 
 	preview := truncateJSON(result.Output, 120)
-	green.Printf("  ✓ %s", name)
+	waypointTeal.Printf("  ✓ %s", name)
 	dimWhite.Printf(" (%s)  %s\n", duration, preview)
 }
 
@@ -184,20 +275,73 @@ func truncateJSON(raw json.RawMessage, maxLen int) string {
 	return s
 }
 
+var (
+	reMdHeader     = regexp.MustCompile(`^\s*#+\s*`)
+	reMdBullet     = regexp.MustCompile(`^\s*[-*+]\s+`)
+	reMdBold       = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	reMdItalic     = regexp.MustCompile(`(^|[^*])\*([^*\s][^*]*[^*\s]|[^*\s])\*([^*]|$)`)
+	reMdCode       = regexp.MustCompile("`([^`]+)`")
+	reMdTableSep   = regexp.MustCompile(`^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$`)
+	reMdTableRow   = regexp.MustCompile(`^\s*\|.*\|\s*$`)
+	reMdBlockquote = regexp.MustCompile(`^\s*>\s*`)
+	reMdWhitespace = regexp.MustCompile(`[ \t]{2,}`)
+)
+
+// stripMarkdown removes markdown syntax from a single line, returning
+// plain prose. Returns "" for purely structural lines (e.g. table separators)
+// so callers can drop them.
+func stripMarkdown(line string) string {
+	s := line
+	if reMdTableSep.MatchString(s) {
+		return ""
+	}
+	s = reMdHeader.ReplaceAllString(s, "")
+	s = reMdBlockquote.ReplaceAllString(s, "")
+	s = reMdBullet.ReplaceAllString(s, "")
+	s = reMdBold.ReplaceAllString(s, "$1")
+	s = reMdItalic.ReplaceAllString(s, "$1$2$3")
+	s = reMdCode.ReplaceAllString(s, "$1")
+	if reMdTableRow.MatchString(s) {
+		cells := strings.Split(strings.Trim(s, " \t|"), "|")
+		for i, c := range cells {
+			cells[i] = strings.TrimSpace(c)
+		}
+		s = strings.Join(cells, "  ")
+	}
+	s = reMdWhitespace.ReplaceAllString(s, " ")
+	return strings.TrimRight(s, " \t")
+}
+
 func printBanner(cfg *config.Config) {
+	tfRows := []string{
+		"  ████████╗███████╗██████╗ ██████╗  █████╗ ███████╗ ██████╗ ██████╗ ███╗   ███╗",
+		"  ╚══██╔══╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔═══██╗██╔══██╗████╗ ████║",
+		"     ██║   █████╗  ██████╔╝██████╔╝███████║█████╗  ██║   ██║██████╔╝██╔████╔██║",
+		"     ██║   ██╔══╝  ██╔══██╗██╔══██╗██╔══██║██╔══╝  ██║   ██║██╔══██╗██║╚██╔╝██║",
+		"     ██║   ███████╗██║  ██║██║  ██║██║  ██║██║     ╚██████╔╝██║  ██║██║ ╚═╝ ██║",
+		"     ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝",
+	}
+	devRows := []string{
+		"██████╗ ███████╗██╗   ██╗",
+		"██╔══██╗██╔════╝██║   ██║",
+		"██║  ██║█████╗  ██║   ██║",
+		"██║  ██║██╔══╝  ╚██╗ ██╔╝",
+		"██████╔╝███████╗ ╚████╔╝ ",
+		"╚═════╝ ╚══════╝  ╚═══╝  ",
+	}
+
 	fmt.Println()
-	magenta.Println(`  ████████╗███████╗██████╗ ██████╗  █████╗ ███████╗ ██████╗ ██████╗ ███╗   ███╗
-  ╚══██╔══╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔═══██╗██╔══██╗████╗ ████║
-     ██║   █████╗  ██████╔╝██████╔╝███████║█████╗  ██║   ██║██████╔╝██╔████╔██║
-     ██║   ██╔══╝  ██╔══██╗██╔══██╗██╔══██║██╔══╝  ██║   ██║██╔══██╗██║╚██╔╝██║
-     ██║   ███████╗██║  ██║██║  ██║██║  ██║██║     ╚██████╔╝██║  ██║██║ ╚═╝ ██║
-     ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝`)
-	boldWhite.Println(`                              ██████╗ ███████╗██╗   ██╗
-                              ██╔══██╗██╔════╝██║   ██║
-                              ██║  ██║█████╗  ██║   ██║
-                              ██║  ██║██╔══╝  ╚██╗ ██╔╝
-                              ██████╔╝███████╗ ╚████╔╝
-                              ╚═════╝ ╚══════╝  ╚═══╝  `)
+	for i := range tfRows {
+		tfPurple.Print(tfRows[i])
+		packerBlue.Println(devRows[i])
+	}
+	fmt.Println()
+	white.Println("  AI-powered development for infrastructure-as-code")
+	dimWhite.Println("  v0.1.0 • Type /help for commands")
+	fmt.Println()
+
+	sepWidth := utf8.RuneCountInString(tfRows[0] + devRows[0])
+	dimWhite.Println(strings.Repeat("-", sepWidth))
 	fmt.Println()
 	dimWhite.Printf("  model: %s  |  mode: readonly  |  type /help for commands\n", cfg.Model)
 	fmt.Println()

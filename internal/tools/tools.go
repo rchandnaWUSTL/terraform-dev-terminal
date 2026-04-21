@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +28,10 @@ type CallResult struct {
 }
 
 func Call(ctx context.Context, name string, args map[string]string, timeoutSec int) *CallResult {
+	if name == "_hcp_tf_workspace_diff" {
+		return workspaceDiffCall(ctx, args, timeoutSec)
+	}
+
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
 
@@ -47,9 +53,10 @@ func Call(ctx context.Context, name string, args map[string]string, timeoutSec i
 		var exitErr *exec.ExitError
 		retryable := false
 		msg := execErr.Error()
+		stderr := ""
 		if e, ok := execErr.(*exec.ExitError); ok {
 			exitErr = e
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
+			stderr = strings.TrimSpace(string(exitErr.Stderr))
 			if stderr != "" {
 				msg = stderr
 			}
@@ -59,7 +66,16 @@ func Call(ctx context.Context, name string, args map[string]string, timeoutSec i
 			msg = fmt.Sprintf("tool timed out after %ds", timeoutSec)
 			retryable = true
 		}
+		if looksLikeHTML(string(out)) || looksLikeHTML(stderr) {
+			result.Err = htmlGuardError()
+			return result
+		}
 		result.Err = &ToolError{ErrorCode: "execution_error", Message: msg, Retryable: retryable}
+		return result
+	}
+
+	if looksLikeHTML(string(out)) {
+		result.Err = htmlGuardError()
 		return result
 	}
 
@@ -67,12 +83,30 @@ func Call(ctx context.Context, name string, args map[string]string, timeoutSec i
 	return result
 }
 
+func looksLikeHTML(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	return strings.HasPrefix(lower, "<!doctype") ||
+		strings.HasPrefix(lower, "<html") ||
+		strings.Contains(lower, "<!doctype") ||
+		strings.Contains(lower, "<html")
+}
+
+func htmlGuardError() *ToolError {
+	return &ToolError{
+		ErrorCode: "404",
+		Message:   "Resource not available or requires a higher plan tier.",
+		Retryable: false,
+	}
+}
+
 func buildArgs(toolName string, args map[string]string) ([]string, error) {
 	switch toolName {
 	case "_hcp_tf_runs_list_recent":
 		return runsListRecent(args)
-	case "_hcp_tf_workspace_diff":
-		return workspaceDiff(args)
 	case "_hcp_tf_workspace_describe":
 		return workspaceDescribe(args)
 	case "_hcp_tf_drift_detect":
@@ -100,17 +134,6 @@ func runsListRecent(args map[string]string) ([]string, error) {
 		return nil, err
 	}
 	return []string{"run", "list",
-		"-org=" + args["org"],
-		"-workspace=" + args["workspace"],
-		"-output=json",
-	}, nil
-}
-
-func workspaceDiff(args map[string]string) ([]string, error) {
-	if err := require(args, "org", "workspace"); err != nil {
-		return nil, err
-	}
-	return []string{"state", "list",
 		"-org=" + args["org"],
 		"-workspace=" + args["workspace"],
 		"-output=json",
@@ -159,6 +182,260 @@ func planSummary(args map[string]string) ([]string, error) {
 	}, nil
 }
 
+func workspaceDiffCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_workspace_diff", Args: args}
+
+	if err := require(args, "org", "workspace_a", "workspace_b"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	orgA := args["org"]
+	orgB := args["org_b"]
+	if orgB == "" {
+		orgB = orgA
+	}
+	wsA := args["workspace_a"]
+	wsB := args["workspace_b"]
+
+	type fetchResult struct {
+		raw []byte
+		err *ToolError
+	}
+	chA := make(chan fetchResult, 1)
+	chB := make(chan fetchResult, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchWorkspaceState(ctx, orgA, wsA, timeoutSec)
+		if ferr != nil {
+			ferr.Message = "workspace_a: " + ferr.Message
+		}
+		chA <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchWorkspaceState(ctx, orgB, wsB, timeoutSec)
+		if ferr != nil {
+			ferr.Message = "workspace_b: " + ferr.Message
+		}
+		chB <- fetchResult{raw: raw, err: ferr}
+	}()
+	wg.Wait()
+	ra := <-chA
+	rb := <-chB
+
+	if ra.err != nil {
+		result.Err = ra.err
+		result.Duration = time.Since(start)
+		return result
+	}
+	if rb.err != nil {
+		result.Err = rb.err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	addrsA, err := parseResourceAddresses(ra.raw)
+	if err != nil {
+		result.Err = &ToolError{ErrorCode: "parse_error", Message: "workspace_a: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	addrsB, err := parseResourceAddresses(rb.raw)
+	if err != nil {
+		result.Err = &ToolError{ErrorCode: "parse_error", Message: "workspace_b: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	setA := make(map[string]struct{}, len(addrsA))
+	for _, a := range addrsA {
+		setA[a] = struct{}{}
+	}
+	setB := make(map[string]struct{}, len(addrsB))
+	for _, a := range addrsB {
+		setB[a] = struct{}{}
+	}
+
+	missingInB := []string{}
+	missingInA := []string{}
+	presentInBoth := []string{}
+	for a := range setA {
+		if _, ok := setB[a]; ok {
+			presentInBoth = append(presentInBoth, a)
+		} else {
+			missingInB = append(missingInB, a)
+		}
+	}
+	for b := range setB {
+		if _, ok := setA[b]; !ok {
+			missingInA = append(missingInA, b)
+		}
+	}
+	sort.Strings(missingInB)
+	sort.Strings(missingInA)
+	sort.Strings(presentInBoth)
+
+	diff := map[string]any{
+		"missing_in_b":               missingInB,
+		"missing_in_a":               missingInA,
+		"present_in_both":            presentInBoth,
+		"workspace_a_resource_count": len(addrsA),
+		"workspace_b_resource_count": len(addrsB),
+	}
+	out, mErr := json.Marshal(diff)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
+func fetchWorkspaceState(ctx context.Context, org, workspace string, timeoutSec int) ([]byte, *ToolError) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "hcptf", "state", "list",
+		"-org="+org,
+		"-workspace="+workspace,
+		"-output=json",
+	)
+	out, execErr := cmd.Output()
+	if execErr != nil {
+		retryable := false
+		msg := execErr.Error()
+		stderr := ""
+		if e, ok := execErr.(*exec.ExitError); ok {
+			stderr = strings.TrimSpace(string(e.Stderr))
+			if stderr != "" {
+				msg = stderr
+			}
+			retryable = e.ExitCode() == 1
+		}
+		if ctx.Err() != nil {
+			msg = fmt.Sprintf("tool timed out after %ds", timeoutSec)
+			retryable = true
+		}
+		if looksLikeHTML(string(out)) || looksLikeHTML(stderr) {
+			return nil, htmlGuardError()
+		}
+		return nil, &ToolError{ErrorCode: "execution_error", Message: msg, Retryable: retryable}
+	}
+	if looksLikeHTML(string(out)) {
+		return nil, htmlGuardError()
+	}
+	return out, nil
+}
+
+// parseResourceAddresses extracts resource address strings from an hcptf state
+// list JSON payload. It tolerates a few plausible shapes: a top-level array of
+// objects, a wrapper object with a "resources"/"items"/"state" list, or a raw
+// array of strings.
+func parseResourceAddresses(raw []byte) ([]string, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return []string{}, nil
+	}
+
+	// Shape 1: []map[string]any
+	var objs []map[string]any
+	if err := json.Unmarshal(raw, &objs); err == nil {
+		return addressesFromObjects(objs), nil
+	}
+
+	// Shape 2: []string
+	var strs []string
+	if err := json.Unmarshal(raw, &strs); err == nil {
+		return strs, nil
+	}
+
+	// Shape 3: wrapper object with a list under a known key
+	var wrapper map[string]any
+	if err := json.Unmarshal(raw, &wrapper); err == nil {
+		for _, key := range []string{"resources", "items", "state", "data"} {
+			v, ok := wrapper[key]
+			if !ok {
+				continue
+			}
+			switch vv := v.(type) {
+			case []any:
+				objs := make([]map[string]any, 0, len(vv))
+				allObj := true
+				for _, el := range vv {
+					if m, ok := el.(map[string]any); ok {
+						objs = append(objs, m)
+					} else {
+						allObj = false
+						break
+					}
+				}
+				if allObj {
+					return addressesFromObjects(objs), nil
+				}
+				strs := make([]string, 0, len(vv))
+				allStr := true
+				for _, el := range vv {
+					if s, ok := el.(string); ok {
+						strs = append(strs, s)
+					} else {
+						allStr = false
+						break
+					}
+				}
+				if allStr {
+					return strs, nil
+				}
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("unrecognized state list JSON shape")
+}
+
+func addressesFromObjects(objs []map[string]any) []string {
+	out := make([]string, 0, len(objs))
+	for _, o := range objs {
+		if addr := stringField(o, "address"); addr != "" {
+			out = append(out, addr)
+			continue
+		}
+		typ := stringField(o, "type")
+		name := stringField(o, "name")
+		mod := stringField(o, "module")
+		switch {
+		case mod != "" && typ != "" && name != "":
+			out = append(out, mod+"."+typ+"."+name)
+		case typ != "" && name != "":
+			out = append(out, typ+"."+name)
+		case name != "":
+			out = append(out, name)
+		default:
+			b, _ := json.Marshal(o)
+			out = append(out, string(b))
+		}
+	}
+	return out
+}
+
+func stringField(m map[string]any, key string) string {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
 // Definitions returns the tool definitions for the Anthropic tool_use API.
 func Definitions() []ToolDef {
 	return []ToolDef{
@@ -176,14 +453,16 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_workspace_diff",
-			Description: "Compares two workspaces: missing resources, config drift, variable mismatches. Call twice (once per workspace) and the agent diffs the results.",
+			Description: "Compares two HCP Terraform workspaces by fetching each workspace's state in parallel and returning a structured resource-address diff: missing_in_a, missing_in_b, present_in_both, plus per-workspace resource counts.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
-					"workspace": map[string]any{"type": "string", "description": "Workspace name to fetch state for"},
+					"org":         map[string]any{"type": "string", "description": "HCP Terraform organization name (also used for workspace_b unless org_b is provided)"},
+					"workspace_a": map[string]any{"type": "string", "description": "First workspace name"},
+					"workspace_b": map[string]any{"type": "string", "description": "Second workspace name"},
+					"org_b":       map[string]any{"type": "string", "description": "Optional organization for workspace_b when diffing across orgs; defaults to org"},
 				},
-				"required": []string{"org", "workspace"},
+				"required": []string{"org", "workspace_a", "workspace_b"},
 			},
 		},
 		{
