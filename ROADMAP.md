@@ -37,6 +37,22 @@
 - Blast radius check before any apply
 - Full audit trail for all mutations
 
+## v0.6 — Config Generation
+- Natural language → Terraform config
+- "Add a WAF to all public ALBs" → agent generates .tf files, opens a PR
+- Option A: write locally to current directory
+- Option B: push directly to VCS repo connected to the workspace (HCP Terraform VCS trigger picks it up automatically)
+- Validate with hcptf plans create --dry-run before proposing
+- Full loop: intent → config → plan → approval → PR
+
+## v0.7 — Application-Aware Infrastructure Generation
+- User runs terraform dev in their application repo root
+- Agent scans the directory — infers runtime, dependencies, and resource requirements from package.json, Dockerfile, requirements.txt, etc.
+- Generates full Terraform config to deploy the application: EKS cluster, ECR repo, ALB, IAM roles, VPC
+- Plans against HCP Terraform workspace before proposing
+- Opens a PR to the connected VCS repo
+- Requires v0.6 config generation foundation
+
 ## v1.0 — Public Launch
 - GoReleaser pipeline with binaries for Mac/Linux/Windows
 - Homebrew tap: `brew install hashicorp/tap/terraform-dev`
