@@ -2,7 +2,7 @@
 
 AI-native terminal REPL for HCP Terraform.
 
-![Demo](demo-v2.gif)
+![Demo](demo-mini.gif)
 
 ## Getting Started
 
