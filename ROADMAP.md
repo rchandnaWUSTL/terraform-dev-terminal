@@ -10,22 +10,36 @@
 - Auth gate: hcptf credentials + ANTHROPIC_API_KEY checked at startup
 - Audit log at ~/.terraform-dev/audit.log
 
-## v0.2 — Model Provider Abstraction
+## v0.2 — Model Provider Abstraction — Shipped
 - Abstract the agent loop behind a ModelProvider interface
 - Implementations: Anthropic (current), OpenAI-compatible (new)
 - Config: `model_provider: anthropic | openai` in ~/.terraform-dev/config.yaml
 - Normalize tool call schema at the provider boundary
 - No user-facing changes; sets up v0.3
 
-## v0.3 — GitHub Copilot Auth
+## v0.3 — GitHub Copilot Auth — Shipped
 - HashiCorp employees already have Copilot licenses — zero adoption barrier
 - `terraform dev --auth=copilot` uses existing Copilot credentials
 - Copilot uses OpenAI-compatible API format; rides on v0.2 abstraction
 - Reference: opencode OSS implementation for credential flow design
 - Goal: internal HashiCorp adoption with no new API keys required
 
-## v0.4 — Richer Data Surface
-- Multi-workspace diff with real org data (prod vs staging)
+## Also shipped (v0.1–v0.3 improvements)
+- Real workspace diff using hcptf workspace resource list — actual resource addresses instead of state version metadata
+- workspace_describe enriched with actual resource types and full inventory
+- Markdown stripping in agent responses
+- HTML error normalization across all 6 tools
+- Structured response format: status line, details, next action
+- HashiCorp brand color palette throughout terminal UI
+- Getting Started section in README with binary install instructions
+- Copilot token cached at ~/.terraform-dev/copilot.json with auto-refresh on 401
+
+## v0.4 — Richer Data Surface (in progress)
+Done:
+- Multi-workspace diff with real resource addresses (prod vs staging)
+- workspace_describe returns actual resource types and inventory
+
+Remaining:
 - Run history with cost delta and resource change breakdown
 - Variable diff across workspaces
 - Policy check results integrated into run summaries
