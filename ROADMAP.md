@@ -85,7 +85,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 
 ## v1.0 — Public Launch
 - GoReleaser pipeline with binaries for Mac/Linux/Windows
-- Homebrew tap: `brew install hashicorp/tap/terraform-dev`
+- Homebrew tap: `brew install terraform-dev`
 - `terraform dev` works as a Terraform CLI subcommand
 - Public README, demo GIF, and docs site
 - GitHub Marketplace listing (requires Copilot auth + Homebrew tap first)
