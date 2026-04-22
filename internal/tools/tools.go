@@ -674,6 +674,10 @@ func fetchVariables(ctx context.Context, org, workspace string, timeoutSec int) 
 	if looksLikeHTML(string(out)) {
 		return nil, htmlGuardError()
 	}
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" || trimmed == "No variables found" {
+		return []byte("[]"), nil
+	}
 	return out, nil
 }
 
