@@ -6,10 +6,17 @@ AI-native terminal REPL for HCP Terraform.
 
 ## Quick start
 
+Prerequisites:
+
+- Go 1.23+
+- [`hcptf`](https://github.com/thrashr888/hcptf-cli) on your `PATH` — install with `go install github.com/thrashr888/hcptf-cli@latest`
+- `ANTHROPIC_API_KEY` set in your environment
+
+Install:
+
 ```bash
 # 1. Install hcptf (HCP Terraform CLI that Terraform Dev shells out to)
-git clone https://github.com/thrashr888/hcptf-cli.git
-cd hcptf-cli && go install ./cmd/hcptf && cd ..
+go install github.com/thrashr888/hcptf-cli@latest
 
 # 2. Build Terraform Dev
 git clone https://github.com/rchandnaWUSTL/terraform-dev-terminal.git
@@ -36,12 +43,10 @@ On first launch, Terraform Dev will run `hcptf login` for you if you don't alrea
 
 ### Installing `hcptf`
 
-Option 1 — build from source (recommended):
+Option 1 — install with Go (recommended):
 
 ```bash
-git clone https://github.com/thrashr888/hcptf-cli.git
-cd hcptf-cli
-go install ./cmd/hcptf       # drops hcptf into $GOPATH/bin (usually $HOME/go/bin)
+go install github.com/thrashr888/hcptf-cli@latest
 hcptf whoami                 # should print your user; if "command not found",
                              # add $HOME/go/bin to $PATH
 ```
