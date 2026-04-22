@@ -151,6 +151,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		}
 	case "/analyze":
 		r.handleAnalyze(parts[1:])
+	case "/diagnose":
+		r.handleDiagnose(parts[1:])
 	default:
 		boundaryPink.Printf("Unknown command: %s\n", parts[0])
 		fmt.Println("Type /help for available commands.")
@@ -445,6 +447,137 @@ func (r *REPL) handleAnalyze(args []string) {
 		return
 	}
 	renderAssessment(parseAssessment(result.Output))
+}
+
+func (r *REPL) handleDiagnose(args []string) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		boundaryPink.Println("Usage: /diagnose <run-id>")
+		return
+	}
+	runID := strings.TrimSpace(args[0])
+	if !strings.HasPrefix(runID, "run-") {
+		boundaryPink.Printf("Invalid run ID %q — expected a run-xxx identifier.\n", runID)
+		return
+	}
+	if r.org == "" || r.workspace == "" {
+		boundaryPink.Println("Set /org and /workspace before running /diagnose.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_run_diagnose", map[string]string{
+		"org":       r.org,
+		"workspace": r.workspace,
+		"run_id":    runID,
+	}, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_run_diagnose: %s\n", result.Err.Message)
+		return
+	}
+	renderDiagnosis(parseDiagnosis(result.Output))
+}
+
+// diagnosisResult is the decoded subset of a _hcp_tf_run_diagnose payload the
+// REPL renders. Fields are optional — missing ones collapse to empty values so
+// the renderer can degrade gracefully on partial responses.
+type diagnosisResult struct {
+	runID       string
+	status      string
+	category    string
+	summary     string
+	detail      string
+	resources   []string
+	logSnippet  string
+	suggestFix  string
+}
+
+func parseDiagnosis(raw json.RawMessage) diagnosisResult {
+	d := diagnosisResult{}
+	if len(raw) == 0 {
+		return d
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return d
+	}
+	if s, ok := m["run_id"].(string); ok {
+		d.runID = s
+	}
+	if s, ok := m["status"].(string); ok {
+		d.status = s
+	}
+	if s, ok := m["error_category"].(string); ok {
+		d.category = s
+	}
+	if s, ok := m["error_summary"].(string); ok {
+		d.summary = s
+	}
+	if s, ok := m["error_detail"].(string); ok {
+		d.detail = s
+	}
+	if s, ok := m["log_snippet"].(string); ok {
+		d.logSnippet = s
+	}
+	if s, ok := m["suggested_fix"].(string); ok {
+		d.suggestFix = s
+	}
+	if arr, ok := m["affected_resources"].([]any); ok {
+		for _, r := range arr {
+			if s, ok := r.(string); ok {
+				d.resources = append(d.resources, s)
+			}
+		}
+	}
+	return d
+}
+
+// renderDiagnosis prints the categorized failure using the HashiCorp palette.
+// Header in boundaryPink, body text in white, log snippet in dimWhite, fix in
+// vaultYellow. Empty sections are skipped rather than rendered as blanks.
+func renderDiagnosis(d diagnosisResult) {
+	category := strings.ToUpper(d.category)
+	if category == "" {
+		category = "UNKNOWN"
+	}
+	fmt.Print("  ")
+	boundaryPink.Add(color.Bold).Printf("Error Category: %s\n", category)
+
+	if d.summary != "" || d.detail != "" {
+		fmt.Println()
+		white.Println("  What went wrong:")
+		if d.summary != "" {
+			white.Printf("    %s\n", d.summary)
+		}
+		if d.detail != "" {
+			dimWhite.Printf("    %s\n", d.detail)
+		}
+	}
+
+	if len(d.resources) > 0 {
+		fmt.Println()
+		white.Println("  Affected resources:")
+		for _, r := range d.resources {
+			white.Printf("    • %s\n", r)
+		}
+	}
+
+	if d.logSnippet != "" {
+		fmt.Println()
+		white.Println("  Log snippet:")
+		for _, line := range strings.Split(d.logSnippet, "\n") {
+			dimWhite.Printf("    %s\n", line)
+		}
+	}
+
+	if d.suggestFix != "" {
+		fmt.Println()
+		white.Println("  Suggested fix:")
+		vaultYellow.Printf("    %s\n", d.suggestFix)
+	}
 }
 
 // assessmentResult is the decoded subset of a _hcp_tf_plan_analyze payload the
@@ -937,6 +1070,7 @@ func printHelp() {
 	fmt.Println("  /workspace <name>  Set default workspace")
 	fmt.Println("  /mode              Show current mode")
 	fmt.Println("  /analyze <run-id>  Risk assessment for a specific run")
+	fmt.Println("  /diagnose <run-id> Categorize a failed run and suggest a fix")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")

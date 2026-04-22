@@ -62,7 +62,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Validation runs automatically after file write
 - Clean error codes when terraform or gh is missing from PATH
 
-## v0.7 — Plan Analyzer (Shipped)
+## v0.7 — Plan Analyzer + Run Diagnostics (Shipped)
 - _hcp_tf_plan_analyze tool with risk scoring heuristics
 - Risk levels: Low / Medium / High / Critical with color coding
 - Blast radius: total resources affected, additions/changes/destructions breakdown
@@ -70,6 +70,10 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - /analyze <run-id> slash command for direct plan analysis
 - Apply gate integrated: risk level determines confirmation requirements (single yes / double yes / workspace name)
 - Failed policies always trigger Critical regardless of other factors
+- _hcp_tf_run_diagnose tool reads plan and apply logs for failed runs and categorizes the error (auth / quota / resource_conflict / provider / config / policy / network / unknown)
+- Categorized diagnosis returns affected resources, a trimmed log snippet, and a plain-English suggested fix
+- /diagnose <run-id> slash command renders the diagnosis with the HashiCorp palette
+- Agent auto-calls _hcp_tf_run_diagnose when the user asks why a run failed, and chains _hcp_tf_policy_check when the category is "policy"
 
 ## v0.8 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root

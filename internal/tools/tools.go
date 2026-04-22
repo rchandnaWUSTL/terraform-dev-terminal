@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -393,6 +394,427 @@ func planAnalyzeCall(ctx context.Context, args map[string]string, timeoutSec int
 	result.Output = json.RawMessage(out)
 	result.Duration = time.Since(start)
 	return result
+}
+
+// runDiagnoseCall fetches run details plus plan and apply logs for a failed
+// run, categorizes the root cause, and returns a structured diagnosis with a
+// suggested fix. Apply logs are optional: when the run errored before the
+// apply phase, the apply-logs fetch will 404 and we degrade gracefully.
+func runDiagnoseCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_run_diagnose", Args: args}
+
+	if err := require(args, "org", "workspace", "run_id"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	runID := args["run_id"]
+
+	type fetchResult struct {
+		raw []byte
+		err *ToolError
+	}
+	chRun := make(chan fetchResult, 1)
+	chPlanLogs := make(chan fetchResult, 1)
+	chApplyLogs := make(chan fetchResult, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "run", "show", "-id="+runID, "-output=json")
+		chRun <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "plan", "logs", "-run-id="+runID, "-output=json")
+		chPlanLogs <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "apply", "logs", "-run-id="+runID, "-output=json")
+		chApplyLogs <- fetchResult{raw: raw, err: ferr}
+	}()
+	wg.Wait()
+	rRun := <-chRun
+	rPlanLogs := <-chPlanLogs
+	rApplyLogs := <-chApplyLogs
+
+	if rRun.err != nil {
+		result.Err = rRun.err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	status := decodeRunStatus(rRun.raw)
+	planLogs := decodeLogsField(rPlanLogs.raw)
+	applyLogs := decodeLogsField(rApplyLogs.raw)
+
+	diag := categorizeFailure(planLogs, applyLogs)
+
+	payload := map[string]any{
+		"run_id":             runID,
+		"status":             status,
+		"error_category":     diag.category,
+		"error_summary":      diag.summary,
+		"error_detail":       diag.detail,
+		"affected_resources": diag.resources,
+		"log_snippet":        diag.snippet,
+		"suggested_fix":      diag.fix,
+	}
+
+	out, mErr := json.Marshal(payload)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// decodeRunStatus pulls the status field out of a `hcptf run read` JSON blob.
+// Returns empty string when the payload is missing or the field is absent.
+func decodeRunStatus(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	return firstStringField(m, "Status", "status")
+}
+
+// decodeLogsField pulls the "logs" string from a `hcptf {plan,apply} logs
+// -output=json` blob. Returns empty string when the payload is missing or
+// unparseable, so callers can degrade gracefully when one phase is absent.
+func decodeLogsField(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	if s, ok := m["logs"].(string); ok {
+		return s
+	}
+	if s, ok := m["Logs"].(string); ok {
+		return s
+	}
+	return ""
+}
+
+// diagnosis is the internal result of categorizeFailure. It is flattened into
+// the tool's JSON payload by runDiagnoseCall.
+type diagnosis struct {
+	category  string
+	summary   string
+	detail    string
+	fix       string
+	snippet   string
+	resources []string
+}
+
+// categoryPlaybook holds the stable prose we return for each error_category.
+// The summary describes what went wrong in one sentence; the fix describes the
+// next action the user should take. Detail is filled in from the matched log
+// line at runtime.
+var categoryPlaybook = map[string]struct {
+	summary string
+	fix     string
+}{
+	"policy": {
+		summary: "The run was blocked by a policy check.",
+		fix:     "Call _hcp_tf_policy_check to see which policies failed, then update the configuration (or request a policy override) so the failing rules pass.",
+	},
+	"quota": {
+		summary: "The cloud provider rejected the change because an account limit or service quota was exceeded.",
+		fix:     "Request a quota increase from the cloud provider, or remove unused resources before re-running.",
+	},
+	"auth": {
+		summary: "The run failed because the configured cloud credentials are not authorized to perform the requested action.",
+		fix:     "Check the cloud credentials (AWS / Azure / GCP) configured as workspace variables. The principal is missing permission for the action above — add it to the IAM role/policy or switch to a principal that has it.",
+	},
+	"resource_conflict": {
+		summary: "A resource the plan wanted to create already exists in the target account.",
+		fix:     "Import the existing resource into Terraform state, rename the new resource, or remove the conflicting one before re-running.",
+	},
+	"network": {
+		summary: "The run failed on a network call — the provider could not reach its API endpoint.",
+		fix:     "Retry the run. If it keeps failing, check VPC endpoints, outbound network access from the HCP Terraform agent, and any firewall rules.",
+	},
+	"provider": {
+		summary: "The Terraform provider itself failed or could not be initialized.",
+		fix:     "Check the provider version pinned in the configuration and the provider's release notes for known issues. A `terraform init -upgrade` followed by a fresh run often clears transient provider install failures.",
+	},
+	"config": {
+		summary: "The plan failed because the Terraform configuration is invalid.",
+		fix:     "Fix the configuration error highlighted in the log snippet and re-run. Running _hcp_tf_config_validate against the local directory can surface the issue before you push again.",
+	},
+	"unknown": {
+		summary: "The run failed, but the error did not match any known category.",
+		fix:     "Review the log snippet below and the full run logs in HCP Terraform for context.",
+	},
+}
+
+// categoryKeywords defines the ordered keyword match list for categorizing a
+// failure. Order matters: policy is checked first because a policy-violation
+// line can contain words like "denied" that would otherwise match auth, and
+// quota is checked before auth because "LimitExceeded" has no auth overlap but
+// "AccessDenied" is unambiguously auth.
+var categoryKeywords = []struct {
+	category string
+	keywords []string
+}{
+	{"policy", []string{"policy check failed", "sentinel", "policy violation", " opa ", "opa policy"}},
+	{"quota", []string{"limitexceeded", "servicequotaexceeded", "quota exceeded", "limit exceeded"}},
+	{"auth", []string{"accessdenied", "unauthorized", "not authorized", " 403 ", "invalidclienttokenid", "signaturedoesnotmatch", "invalid credentials"}},
+	{"resource_conflict", []string{"alreadyexists", "already exists", "bucketalreadyownedbyyou", "duplicate resource", "conflict:"}},
+	{"network", []string{"dial tcp", "connection refused", "no route to host", "i/o timeout", "context deadline exceeded", "tls handshake"}},
+	{"provider", []string{"provider produced", "protorpc", "incompatible provider", "failed to install provider", "plugin did not respond"}},
+	{"config", []string{"unsupported argument", "unknown field", "syntax error", "parse error", "invalid configuration", "error: invalid"}},
+}
+
+// categorizeFailure scans plan and apply log content and returns a diagnosis.
+// Pure function — no I/O — so it can be table-tested in isolation.
+func categorizeFailure(planLogs, applyLogs string) diagnosis {
+	// Favor apply logs for the snippet when apply ran, but scan both streams
+	// for category keywords so we don't miss a policy block that happens in
+	// the plan phase when apply also produced noise.
+	primary := applyLogs
+	if strings.TrimSpace(primary) == "" {
+		primary = planLogs
+	}
+	combined := planLogs
+	if applyLogs != "" {
+		if combined != "" {
+			combined += "\n"
+		}
+		combined += applyLogs
+	}
+
+	lines := splitLogLines(combined)
+	primaryLines := splitLogLines(primary)
+
+	category := "unknown"
+	var matched string
+	for _, bucket := range categoryKeywords {
+		if line, ok := findFirstMatch(lines, bucket.keywords); ok {
+			category = bucket.category
+			matched = line
+			break
+		}
+	}
+
+	play := categoryPlaybook[category]
+
+	d := diagnosis{
+		category: category,
+		summary:  play.summary,
+		fix:      play.fix,
+	}
+	if matched != "" {
+		d.detail = trimLine(matched)
+	}
+
+	d.snippet = buildSnippet(primaryLines, matched, 5)
+	// Resource addresses rarely appear on the error line itself — the provider
+	// error is usually a separate line from the "Plan to create" / "Creating"
+	// line that names the resource. Scan the tail of the combined log so we
+	// catch the resource that was in-flight when the error fired.
+	d.resources = extractResources(tailLines(lines, 20), matched)
+	return d
+}
+
+// tailLines returns the last n lines, joined by newline. Used to widen the
+// search window for resource address extraction beyond the single matched
+// line.
+func tailLines(lines []string, n int) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	start := len(lines) - n
+	if start < 0 {
+		start = 0
+	}
+	return strings.Join(lines[start:], "\n")
+}
+
+var logLineSep = regexp.MustCompile(`\r?\n`)
+
+func splitLogLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	raw := logLineSep.Split(s, -1)
+	out := make([]string, 0, len(raw))
+	for _, line := range raw {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// findFirstMatch returns the first log line that contains any of the given
+// keywords (case-insensitive). The search is ordered by line so we report the
+// earliest occurrence of the error.
+func findFirstMatch(lines []string, keywords []string) (string, bool) {
+	for _, line := range lines {
+		lower := strings.ToLower(line)
+		for _, kw := range keywords {
+			if strings.Contains(lower, strings.ToLower(kw)) {
+				return line, true
+			}
+		}
+	}
+	return "", false
+}
+
+// buildSnippet returns up to n log lines of context. When a keyword line was
+// matched we anchor on that line; otherwise we fall back to the tail of the
+// log which is where Terraform prints its final error block.
+func buildSnippet(lines []string, matched string, n int) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	end := len(lines)
+	idx := -1
+	if matched != "" {
+		for i, line := range lines {
+			if line == matched {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx >= 0 {
+		end = idx + 1
+		if end > len(lines) {
+			end = len(lines)
+		}
+	}
+	start := end - n
+	if start < 0 {
+		start = 0
+	}
+	picked := lines[start:end]
+	out := make([]string, 0, len(picked))
+	for _, line := range picked {
+		out = append(out, trimLine(line))
+	}
+	return strings.Join(out, "\n")
+}
+
+var jsonMessageRe = regexp.MustCompile(`"@message"\s*:\s*"((?:[^"\\]|\\.)*)"`)
+
+// trimLine strips JSON wrappers from Terraform's structured log stream so a
+// line like {"@level":"error","@message":"...","@module":"terraform.ui"} is
+// rendered as just the human-readable message. Falls back to the raw line
+// when no @message field is present.
+func trimLine(line string) string {
+	line = strings.TrimSpace(line)
+	if strings.HasPrefix(line, "{") && strings.Contains(line, "@message") {
+		if m := jsonMessageRe.FindStringSubmatch(line); len(m) == 2 {
+			return unescapeJSONString(m[1])
+		}
+	}
+	return line
+}
+
+func unescapeJSONString(s string) string {
+	s = strings.ReplaceAll(s, `\"`, `"`)
+	s = strings.ReplaceAll(s, `\n`, "\n")
+	s = strings.ReplaceAll(s, `\t`, "\t")
+	s = strings.ReplaceAll(s, `\\`, `\`)
+	return s
+}
+
+var resourceAddrRe = regexp.MustCompile(`\b([a-z][a-z0-9_]*\.[A-Za-z_][A-Za-z0-9_-]*)\b`)
+
+// extractResources pulls Terraform-style resource addresses (e.g.
+// aws_vpc.main) out of the given text. Dedupes and caps at 5. Filters out
+// obvious non-resource tokens: log module names (terraform.ui), URL fragments
+// (registry.terraform — this is a greedy match over `registry.terraform.io`),
+// and any match that is followed by `.` or `/` in the source, since that
+// means we hit a hostname or path rather than a resource address.
+func extractResources(text string, preferredLine string) []string {
+	if text == "" && preferredLine == "" {
+		return nil
+	}
+	// Known-good resource-name prefixes suggest the first segment is a Terraform
+	// provider. A conservative denylist handles the log-wrapper noise without
+	// false-rejecting legitimate resources.
+	skipPrefixes := []string{
+		"terraform.",
+		"registry.",
+		"hashicorp.",
+		"github.",
+		"golang.",
+		"app.",
+	}
+
+	seen := map[string]bool{}
+	out := make([]string, 0, 5)
+	consider := func(body string) {
+		matches := resourceAddrRe.FindAllStringSubmatchIndex(body, -1)
+		for _, m := range matches {
+			full := body[m[2]:m[3]]
+			end := m[3]
+			// Reject if the token continues into a URL/path/email (e.g.
+			// "registry.terraform.io/...", "roshan.chandna@hashicorp.com").
+			if end < len(body) {
+				next := body[end]
+				if next == '.' || next == '/' || next == '@' {
+					continue
+				}
+			}
+			// Terraform resource types are snake_case with at least one
+			// underscore in the first segment (aws_vpc, random_id,
+			// null_resource). This filters out filenames like "main.tf" and
+			// names like "roshan.chandna" without maintaining a denylist.
+			dot := strings.IndexByte(full, '.')
+			if dot <= 0 || !strings.ContainsRune(full[:dot], '_') {
+				continue
+			}
+			lower := strings.ToLower(full)
+			skip := false
+			for _, p := range skipPrefixes {
+				if strings.HasPrefix(lower, p) {
+					skip = true
+					break
+				}
+			}
+			if skip {
+				continue
+			}
+			if seen[full] {
+				continue
+			}
+			seen[full] = true
+			out = append(out, full)
+			if len(out) >= 5 {
+				return
+			}
+		}
+	}
+
+	// Prefer the matched error line when it names a resource; fall back to the
+	// broader tail so we catch the resource that was in-flight during the
+	// error.
+	if preferredLine != "" {
+		consider(preferredLine)
+	}
+	if len(out) < 5 {
+		consider(text)
+	}
+	return out
 }
 
 // fetchHCPTFJSON shells out to hcptf with the given args and returns the raw
@@ -987,6 +1409,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	}
 	if name == "_hcp_tf_plan_analyze" {
 		return planAnalyzeCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_run_diagnose" {
+		return runDiagnoseCall(ctx, args, timeoutSec)
 	}
 	if name == "_hcp_tf_config_validate" {
 		return configValidateCall(ctx, args, timeoutSec)
@@ -1806,6 +2231,19 @@ func Definitions() []ToolDef {
 		{
 			Name:        "_hcp_tf_plan_analyze",
 			Description: "Produces a structured risk assessment for a run: risk level (Low|Medium|High|Critical), specific risk factors with severity and affected resources, blast radius (adds/changes/destroys plus highest-risk resources), optional policy-check results when policies are attached, and a recommendation (safe_to_apply|review_before_applying|do_not_apply) with plain-English reasoning. Read-only; safe to call in readonly and apply modes.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
+					"run_id":    map[string]any{"type": "string", "description": "Run ID (run-xxx)"},
+				},
+				"required": []string{"org", "workspace", "run_id"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_run_diagnose",
+			Description: "Explains why a run failed. Fetches run details plus plan and apply logs, categorizes the error (auth|quota|resource_conflict|provider|config|policy|network|unknown), extracts the affected resource addresses and the most relevant log snippet, and returns a suggested fix in plain English. Call this whenever the user asks why a run failed or what went wrong. Read-only; safe to call in readonly and apply modes.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
