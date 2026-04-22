@@ -73,7 +73,17 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Auth errors surface workspace credential check suggestion
 - Policy errors chain _hcp_tf_policy_check automatically
 
-## v0.8 — Application-Aware Infrastructure Generation
+## v0.8 — Run Task Integrations
+- _hcp_tf_runtask_list: list run tasks configured on a workspace
+- _hcp_tf_runtask_attach: deploy an AI-powered run task integration to a workspace
+- Built-in support for two community run task modules:
+  - terraform-aws-runtask-tf-plan-analyzer (AWS Bedrock + Claude) — github.com/aws-ia/terraform-aws-runtask-tf-plan-analyzer
+  - terraform-google-ai-debugger (Google Vertex AI + Gemini) — github.com/gautambaghel/terraform-google-ai-debugger
+- "Attach AI plan analysis to prod-k8s-apps" → terraform-dev deploys the run task and wires it to the workspace automatically
+- Complements the local _hcp_tf_plan_analyze tool with a server-side, always-on analysis layer
+- Requires --apply mode (run task attachment is a mutation)
+
+## v0.9 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root
 - Agent scans the directory — infers runtime, dependencies, and resource requirements from package.json, Dockerfile, requirements.txt, etc.
 - Generates full Terraform config to deploy the application: EKS cluster, ECR repo, ALB, IAM roles, VPC
@@ -81,7 +91,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Opens a PR to the connected VCS repo
 - Requires v0.6 config generation foundation
 
-## v0.9 — Stacks Integration
+## v0.10 — Stacks Integration
 - Point the agent at the HCP Terraform Stacks knowledge base
 - Stack-aware tools: list stacks, describe stack configurations, compare stack deployments
 - Natural language queries about stack topology and dependencies
@@ -106,3 +116,6 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Monitors workspaces for drift, policy failures, cost spikes, expiring credentials
 - Sends alerts via Slack or email when thresholds are crossed
 - Shift from reactive (answer questions) to proactive (surface problems)
+
+## v1.3 — Reserved
+- Placeholder for post-Concierge work; specifics to be defined.
