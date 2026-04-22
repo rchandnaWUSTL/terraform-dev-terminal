@@ -4,34 +4,52 @@ AI-native terminal REPL for HCP Terraform.
 
 ![Demo](demo-v2.gif)
 
-## Quick start
+## Getting Started
 
-Prerequisites:
+### 1. Install `hcptf`
 
-- Go 1.23+
-- [`hcptf`](https://github.com/thrashr888/hcptf-cli) on your `PATH` — install with `go install github.com/thrashr888/hcptf-cli@latest`
-- `ANTHROPIC_API_KEY` set in your environment
-
-Install:
+Binary install only — `go install` does not work because of a module path mismatch in the upstream repo.
 
 ```bash
-# 1. Install hcptf (HCP Terraform CLI that Terraform Dev shells out to)
-go install github.com/thrashr888/hcptf-cli@latest
+curl -LO https://github.com/thrashr888/hcptf-cli/releases/download/v0.6.0/hcptf-cli_0.6.0_darwin_arm64.tar.gz
+tar -xzf hcptf-cli_0.6.0_darwin_arm64.tar.gz
+mkdir -p ~/bin && mv hcptf ~/bin/hcptf && chmod +x ~/bin/hcptf
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+hcptf version
+```
 
-# 2. Build Terraform Dev
+> For other platforms see the full release list at [hcptf-cli releases](https://github.com/thrashr888/hcptf-cli/releases).
+
+### 2. Authenticate with HCP Terraform
+
+```bash
+hcptf login
+```
+
+### 3. Clone and build Terraform Dev
+
+```bash
 git clone https://github.com/rchandnaWUSTL/terraform-dev-terminal.git
 cd terraform-dev-terminal
 go build -o terraform-dev ./cmd/terraform-dev
-
-# 3. Authenticate with your model provider (pick one — see "Authentication" below)
-export ANTHROPIC_API_KEY=sk-ant-...   # option A: Anthropic
-#   …or skip this and pass --auth=copilot on first run (option B: GitHub Copilot)
-
-# 4. Run it
-./terraform-dev --org=<your-org> --workspace=<your-workspace>
 ```
 
-On first launch, Terraform Dev will run `hcptf login` for you if you don't already have HCP Terraform credentials — follow the browser prompt it opens.
+### 4. Run with Anthropic
+
+```bash
+export ANTHROPIC_API_KEY=your-key
+./terraform-dev --org=your-org --workspace=your-workspace
+```
+
+### 5. Run with GitHub Copilot
+
+No API key needed — uses your existing Copilot license.
+
+```bash
+./terraform-dev --auth=copilot --org=your-org --workspace=your-workspace
+```
+
+Follow the device flow prompt to authenticate.
 
 ---
 
