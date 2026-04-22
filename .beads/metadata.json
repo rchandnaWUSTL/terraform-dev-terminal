@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "terraform_dev_terminal",
-  "project_id": "f666db76-1705-4647-93e9-c47abbd33e61"
-}
