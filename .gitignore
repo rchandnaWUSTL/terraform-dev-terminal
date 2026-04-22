@@ -21,3 +21,6 @@ vendor/
 
 # Beads tracking (local only)
 .beads/
+*.gif
+.terraform/
+demo*.cast
