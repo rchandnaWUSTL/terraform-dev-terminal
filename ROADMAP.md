@@ -17,6 +17,8 @@
 - Normalize tool call schema at the provider boundary
 - No user-facing changes; sets up v0.3
 
+Note: Revisit adopting opencode's provider framework when a third provider is needed. Current abstraction works well for two providers; framework adoption trades control for convenience.
+
 ## v0.3 — GitHub Copilot Auth — Shipped
 - HashiCorp employees already have Copilot licenses — zero adoption barrier
 - `terraform dev --auth=copilot` uses existing Copilot credentials
@@ -68,6 +70,19 @@
 - Opens a PR to the connected VCS repo
 - Requires v0.6 config generation foundation
 
+## v0.8 — Plan Analyzer
+- Deep plan analysis beyond simple summarization
+- Flag risky changes: unexpected destructions, security group changes, IAM modifications
+- Blast radius scoring: rate the risk of a plan before the approval gate
+- Policy pre-check: validate against org Sentinel/OPA policies before creating a run
+- Makes the v0.5 apply gate significantly smarter
+
+## v0.9 — Stacks Integration
+- Point the agent at the HCP Terraform Stacks knowledge base
+- Stack-aware tools: list stacks, describe stack configurations, compare stack deployments
+- Natural language queries about stack topology and dependencies
+- High internal HashiCorp value — Stacks is where enterprise customers are headed
+
 ## v1.0 — Public Launch
 - GoReleaser pipeline with binaries for Mac/Linux/Windows
 - Homebrew tap: `brew install hashicorp/tap/terraform-dev`
@@ -75,3 +90,15 @@
 - Public README, demo GIF, and docs site
 - GitHub Marketplace listing (requires Copilot auth + Homebrew tap first)
 - List application at: https://github.com/marketplace
+
+## v1.1 — API Surface + Web UI
+- Wrap the agent loop in an HTTP API
+- Same tools and agent, accessible from a web chat UI
+- Makes terraform-dev accessible to non-terminal users: PMs, security teams, compliance
+- Provider abstraction already in place — the terminal is just one UX on top
+
+## v1.2 — Concierge Mode
+- Proactive agent that surfaces issues without being asked
+- Monitors workspaces for drift, policy failures, cost spikes, expiring credentials
+- Sends alerts via Slack or email when thresholds are crossed
+- Shift from reactive (answer questions) to proactive (surface problems)
