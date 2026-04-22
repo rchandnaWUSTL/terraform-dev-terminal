@@ -62,20 +62,20 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Validation runs automatically after file write
 - Clean error codes when terraform or gh is missing from PATH
 
-## v0.7 — Application-Aware Infrastructure Generation
+## v0.7 — Plan Analyzer
+- Deep plan analysis beyond simple summarization
+- Flag risky changes: unexpected destructions, security group changes, IAM modifications
+- Blast radius scoring: rate the risk of a plan before the approval gate
+- Policy pre-check: validate against org Sentinel/OPA policies before creating a run
+- Makes the v0.5 apply gate significantly smarter
+
+## v0.8 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root
 - Agent scans the directory — infers runtime, dependencies, and resource requirements from package.json, Dockerfile, requirements.txt, etc.
 - Generates full Terraform config to deploy the application: EKS cluster, ECR repo, ALB, IAM roles, VPC
 - Plans against HCP Terraform workspace before proposing
 - Opens a PR to the connected VCS repo
 - Requires v0.6 config generation foundation
-
-## v0.8 — Plan Analyzer
-- Deep plan analysis beyond simple summarization
-- Flag risky changes: unexpected destructions, security group changes, IAM modifications
-- Blast radius scoring: rate the risk of a plan before the approval gate
-- Policy pre-check: validate against org Sentinel/OPA policies before creating a run
-- Makes the v0.5 apply gate significantly smarter
 
 ## v0.9 — Stacks Integration
 - Point the agent at the HCP Terraform Stacks knowledge base
