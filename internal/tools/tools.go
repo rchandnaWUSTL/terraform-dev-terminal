@@ -54,6 +54,181 @@ func LogCancellation(name string, args map[string]string, result *CallResult) {
 	writeAuditLog(name, args, result)
 }
 
+// configValidateCall runs `terraform validate -json` in the given directory.
+// When `.terraform` is absent, a best-effort `terraform init -backend=false
+// -input=false` is run first so providers referenced by the config can be
+// resolved; init failures are surfaced but do not short-circuit validation.
+func configValidateCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_config_validate", Args: args}
+
+	if err := require(args, "config_path"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	dir := args["config_path"]
+	if _, err := os.Stat(dir); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: fmt.Sprintf("config_path does not exist: %s", dir), Retryable: false}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	if _, err := exec.LookPath("terraform"); err != nil {
+		result.Err = &ToolError{ErrorCode: "terraform_not_found", Message: "terraform CLI not found on PATH", Retryable: false}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, ".terraform")); err != nil {
+		ictx, icancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		defer icancel()
+		initCmd := exec.CommandContext(ictx, "terraform", "init", "-backend=false", "-input=false", "-no-color")
+		initCmd.Dir = dir
+		_ = initCmd.Run()
+	}
+
+	vctx, vcancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer vcancel()
+	cmd := exec.CommandContext(vctx, "terraform", "validate", "-json")
+	cmd.Dir = dir
+	out, execErr := cmd.Output()
+	result.Duration = time.Since(start)
+
+	// `terraform validate -json` always prints a JSON document and exits 0 when
+	// valid, 1 when invalid; both cases are reported through the document.
+	if len(out) > 0 {
+		var tfResp struct {
+			Valid       bool `json:"valid"`
+			Diagnostics []struct {
+				Severity string `json:"severity"`
+				Summary  string `json:"summary"`
+				Detail   string `json:"detail"`
+			} `json:"diagnostics"`
+		}
+		if jerr := json.Unmarshal(out, &tfResp); jerr == nil {
+			errs := []map[string]string{}
+			for _, d := range tfResp.Diagnostics {
+				if d.Severity == "error" {
+					errs = append(errs, map[string]string{"summary": d.Summary, "detail": d.Detail})
+				}
+			}
+			summary := map[string]any{"valid": tfResp.Valid, "errors": errs}
+			enc, _ := json.Marshal(summary)
+			result.Output = json.RawMessage(enc)
+			return result
+		}
+	}
+
+	// Unparseable output: treat any non-zero exit as a generic execution error.
+	if execErr != nil {
+		result.Err = normalizeExecError(execErr, vctx, out, timeoutSec)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	return result
+}
+
+// prCreateCall opens a pull request for generated configuration. It creates
+// and pushes a branch from the current HEAD, then calls `gh pr create`. The
+// caller is responsible for having staged file contents on disk before
+// invocation.
+func prCreateCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_pr_create", Args: args}
+
+	if err := require(args, "branch_name", "commit_message"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		result.Err = &ToolError{ErrorCode: "gh_not_found", Message: "GitHub CLI (gh) not found. Install it to open PRs automatically.", Retryable: false}
+		result.Duration = time.Since(start)
+		return result
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		result.Err = &ToolError{ErrorCode: "git_not_found", Message: "git not found on PATH", Retryable: false}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	branch := args["branch_name"]
+	commitMsg := args["commit_message"]
+	fileList := strings.Split(strings.TrimSpace(args["files"]), ",")
+	cleanFiles := fileList[:0]
+	for _, f := range fileList {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			cleanFiles = append(cleanFiles, f)
+		}
+	}
+
+	run := func(name string, cmdArgs ...string) ([]byte, *ToolError) {
+		cctx, ccancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		defer ccancel()
+		out, err := exec.CommandContext(cctx, name, cmdArgs...).CombinedOutput()
+		if err != nil {
+			msg := strings.TrimSpace(string(out))
+			if msg == "" {
+				msg = err.Error()
+			}
+			return out, &ToolError{ErrorCode: "execution_error", Message: msg, Retryable: false}
+		}
+		return out, nil
+	}
+
+	if _, terr := run("git", "checkout", "-b", branch); terr != nil {
+		result.Err = terr
+		result.Duration = time.Since(start)
+		return result
+	}
+	if len(cleanFiles) > 0 {
+		addArgs := append([]string{"add", "--"}, cleanFiles...)
+		if _, terr := run("git", addArgs...); terr != nil {
+			result.Err = terr
+			result.Duration = time.Since(start)
+			return result
+		}
+	} else {
+		if _, terr := run("git", "add", "-A"); terr != nil {
+			result.Err = terr
+			result.Duration = time.Since(start)
+			return result
+		}
+	}
+	if _, terr := run("git", "commit", "-m", commitMsg); terr != nil {
+		result.Err = terr
+		result.Duration = time.Since(start)
+		return result
+	}
+	if _, terr := run("git", "push", "-u", "origin", branch); terr != nil {
+		result.Err = terr
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	prOut, terr := run("gh", "pr", "create", "--base", "main", "--head", branch, "--title", commitMsg, "--body", "Generated by terraform-dev.")
+	if terr != nil {
+		result.Err = terr
+		result.Duration = time.Since(start)
+		return result
+	}
+	prURL := ""
+	for _, line := range strings.Split(strings.TrimSpace(string(prOut)), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "https://") {
+			prURL = line
+			break
+		}
+	}
+	payload := map[string]any{"pr_url": prURL, "branch": branch}
+	enc, _ := json.Marshal(payload)
+	result.Output = json.RawMessage(enc)
+	result.Duration = time.Since(start)
+	return result
+}
+
 // planSummaryCall fetches the plan summary and best-effort enriches it with a
 // formatted monthly cost delta extracted from `hcptf run read`. Cost lookup
 // errors never fail the call — the field is simply omitted.
@@ -268,6 +443,12 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	}
 	if name == "_hcp_tf_plan_summary" {
 		return planSummaryCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_config_validate" {
+		return configValidateCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_pr_create" {
+		return prCreateCall(ctx, args, timeoutSec)
 	}
 
 	start := time.Now()
@@ -1115,6 +1296,32 @@ func Definitions() []ToolDef {
 					"comment": map[string]any{"type": "string", "description": "Comment recorded on the discard"},
 				},
 				"required": []string{"run_id", "comment"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_config_validate",
+			Description: "Runs `terraform validate` against a local directory containing .tf files and returns { valid, errors } describing any HCL or schema issues. A best-effort `terraform init -backend=false` is run first when providers are not yet installed. Returns { error_code: terraform_not_found } when the terraform CLI is unavailable.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"config_path": map[string]any{"type": "string", "description": "Absolute or working-directory-relative path to the directory containing .tf files to validate."},
+				},
+				"required": []string{"config_path"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_pr_create",
+			Description: "Creates a new branch from HEAD, commits the specified files, pushes to origin, and opens a GitHub pull request against main using the gh CLI. Returns { pr_url, branch }. Returns { error_code: gh_not_found } when the GitHub CLI is not installed.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":            map[string]any{"type": "string", "description": "HCP Terraform organization name (optional, informational)"},
+					"workspace":      map[string]any{"type": "string", "description": "HCP Terraform workspace name (optional, informational)"},
+					"branch_name":    map[string]any{"type": "string", "description": "Name of the branch to create and push"},
+					"commit_message": map[string]any{"type": "string", "description": "Commit subject, also used as the PR title"},
+					"files":          map[string]any{"type": "string", "description": "Comma-separated list of file paths to include in the commit (relative to the current directory). If empty, `git add -A` is used."},
+				},
+				"required": []string{"branch_name", "commit_message"},
 			},
 		},
 	}

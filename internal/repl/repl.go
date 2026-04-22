@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -166,6 +167,7 @@ func (r *REPL) ask(userMsg string) {
 
 	fmt.Println()
 	var buf strings.Builder
+	var full strings.Builder
 	firstLine := true
 	flushLine := func(line string) {
 		clean := stripMarkdown(line)
@@ -191,6 +193,7 @@ func (r *REPL) ask(userMsg string) {
 			break
 		}
 		buf.WriteString(chunk.Text)
+		full.WriteString(chunk.Text)
 		for {
 			s := buf.String()
 			idx := strings.IndexByte(s, '\n')
@@ -206,6 +209,8 @@ func (r *REPL) ask(userMsg string) {
 		flushLine(buf.String())
 	}
 	fmt.Println()
+
+	r.handleGeneratedConfig(ctx, full.String())
 }
 
 // recordToolResult captures the last successful plan_summary and run_create
@@ -373,6 +378,68 @@ func describeAction(name string, args map[string]string) string {
 		return "discard the pending run"
 	}
 	return "perform a mutation"
+}
+
+// reHCLBlock matches fenced HCL/Terraform code blocks in the agent's response
+// and captures the body.
+var reHCLBlock = regexp.MustCompile("(?s)```(?:hcl|terraform|tf)\\s*\n(.*?)```")
+
+// reFilenameHint captures `# filename: path.tf` hints in a code block so the
+// agent can name generated files.
+var reFilenameHint = regexp.MustCompile(`(?m)^\s*#\s*filename:\s*([^\s]+)\s*$`)
+
+// handleGeneratedConfig scans the final agent response for HCL code blocks,
+// writes them to the current working directory (prompting before overwriting
+// existing files), and auto-runs _hcp_tf_config_validate so the user sees the
+// validation result inline.
+func (r *REPL) handleGeneratedConfig(ctx context.Context, response string) {
+	blocks := reHCLBlock.FindAllStringSubmatch(response, -1)
+	if len(blocks) == 0 {
+		return
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		boundaryPink.Printf("  ✗ Cannot resolve working directory: %v\n", err)
+		return
+	}
+
+	wrote := false
+	for i, m := range blocks {
+		body := m[1]
+		filename := "suggested_config.tf"
+		if hit := reFilenameHint.FindStringSubmatch(body); hit != nil {
+			filename = filepath.Base(hit[1])
+			body = reFilenameHint.ReplaceAllString(body, "")
+		}
+		if len(blocks) > 1 && filename == "suggested_config.tf" {
+			filename = fmt.Sprintf("suggested_config_%d.tf", i+1)
+		}
+		path := filepath.Join(cwd, filename)
+		if _, err := os.Stat(path); err == nil {
+			vaultYellow.Printf("  ⚠ %s already exists. Overwrite? Type 'yes' to confirm or anything else to skip.\n", filename)
+			if !r.readYes() {
+				boundaryPink.Printf("  Skipped %s\n", filename)
+				continue
+			}
+		}
+		content := strings.TrimSpace(body) + "\n"
+		if werr := os.WriteFile(path, []byte(content), 0644); werr != nil {
+			boundaryPink.Printf("  ✗ Failed to write %s: %v\n", filename, werr)
+			continue
+		}
+		waypointTeal.Printf("  ✓ Written to ./%s\n", filename)
+		wrote = true
+	}
+
+	if !wrote {
+		return
+	}
+
+	vctx, vcancel := context.WithTimeout(ctx, time.Duration(r.cfg.TimeoutSeconds*6)*time.Second)
+	defer vcancel()
+	result := tools.Call(vctx, "_hcp_tf_config_validate", map[string]string{"config_path": cwd}, r.cfg.TimeoutSeconds*6)
+	printToolResult("_hcp_tf_config_validate", result)
 }
 
 var spinnerFrames = []string{"|", "/", "-", "\\"}

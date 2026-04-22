@@ -68,12 +68,21 @@ const modeRulesApply = `- APPLY mode is enabled. You may propose creating and ap
 - If the plan has destructions > 0, warn the user explicitly before proceeding.
 - Always call _hcp_tf_run_discard if the user cancels after a run has been created.`
 
+const configGenRules = `
+
+Config generation:
+- When the user asks to generate, create, or add Terraform configuration, emit the HCL inside a fenced code block tagged hcl or terraform. The first line of the block may contain a comment like "# filename: main.tf" to choose the file name; otherwise the content is written to suggested_config.tf in the current working directory.
+- The REPL saves the code block to disk and automatically calls _hcp_tf_config_validate against the directory. If validation reports errors, revise the config and re-emit a corrected block.
+- After the code is shown, offer the user two options in plain prose: (A) the files are already saved locally, (B) open a pull request by asking you to call _hcp_tf_pr_create with a branch name and commit message.
+- Never generate config that includes hardcoded credentials, account IDs, or other sensitive values — use variables and reference them from the workspace's existing variable set.
+- Generated config must follow HashiCorp style: 2-space indentation, variables at the top of the file, resources before data sources.`
+
 func buildSystemPrompt(readonly bool) string {
 	rules := modeRulesApply
 	if readonly {
 		rules = modeRulesReadonly
 	}
-	return fmt.Sprintf(systemPromptCore, rules)
+	return fmt.Sprintf(systemPromptCore, rules) + configGenRules
 }
 
 // ApprovalFunc is invoked before a mutating tool executes. Returning false
