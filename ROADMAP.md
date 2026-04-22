@@ -51,13 +51,14 @@
 - Cost estimate surfaced in plan summary when available
 - Mutating tools invisible to model in readonly mode
 
-## v0.6 — Config Generation
+## v0.6 — Config Generation (Shipped)
 - Natural language → Terraform config
-- "Add a WAF to all public ALBs" → agent generates .tf files, opens a PR
-- Option A: write locally to current directory
-- Option B: push directly to VCS repo connected to the workspace (HCP Terraform VCS trigger picks it up automatically)
-- Validate with hcptf plans create --dry-run before proposing
-- Full loop: intent → config → plan → approval → PR
+- Agent emits HCL in fenced code blocks; REPL extracts and writes to cwd
+- _hcp_tf_config_validate runs `terraform validate -json` (with best-effort init)
+- _hcp_tf_pr_create creates a branch, commits, pushes, and opens a PR via gh
+- Existing-file overwrite protection (prompt before replacing)
+- Validation runs automatically after file write
+- Clean error codes when terraform or gh is missing from PATH
 
 ## v0.7 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root
