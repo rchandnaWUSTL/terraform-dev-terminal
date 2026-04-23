@@ -83,12 +83,13 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Complements the local _hcp_tf_plan_analyze tool with a server-side, always-on analysis layer
 - Requires --apply mode (run task attachment is a mutation)
 
-## v0.9 — Stacks Integration (In Progress)
-- Stack discovery: _hcp_tf_stacks_list lists stacks in the org
-- Stack topology and health: _hcp_tf_stack_describe returns components, deployments, health (Healthy/Degraded/Unknown), and limitations
-- Stacks vs workspaces guidance: _hcp_tf_stack_vs_workspace returns deterministic recommendation based on use-case keywords
-- New /stacks REPL slash command for quick org-wide stack listing
-- System prompt extended with Stacks rules and GA-limitation disclosures (no policy as code, no drift detection, no run tasks, max 20 deployments)
+## v0.9 — Stacks Integration (Shipped)
+- _hcp_tf_stacks_list: lists all stacks in org with deployment counts and health
+- _hcp_tf_stack_describe: describes stack topology, components, deployments, and GA limitations
+- _hcp_tf_stack_vs_workspace: deterministic recommendation engine for stack vs workspace decisions
+- /stacks slash command with empty-state guidance and docs link
+- Agent surfaces Stacks GA limitations automatically (no policy as code, no drift detection, max 20 deployments)
+- Health computed from deployment run status (Unknown when no runs exist)
 
 ## v0.10 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root
