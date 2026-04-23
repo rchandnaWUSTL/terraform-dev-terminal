@@ -156,7 +156,7 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 	case "/stacks":
 		r.handleStacks()
 	case "/workspaces":
-		r.handleWorkspaces()
+		r.handleWorkspaces(parts[1:])
 	default:
 		boundaryPink.Printf("Unknown command: %s\n", parts[0])
 		fmt.Println("Type /help for available commands.")
@@ -454,12 +454,17 @@ func (r *REPL) handleAnalyze(args []string) {
 }
 
 // handleWorkspaces implements /workspaces by calling _hcp_tf_workspaces_list
-// for the pinned org and rendering a one-line-per-workspace summary.
-func (r *REPL) handleWorkspaces() {
+// for the pinned org and rendering a one-line-per-workspace summary. When a
+// filter argument is supplied, only workspaces whose name contains the filter
+// (case-insensitive) are shown.
+func (r *REPL) handleWorkspaces(args []string) {
 	if r.org == "" {
 		boundaryPink.Println("Set an org first with /org <name>")
 		return
 	}
+
+	filter := strings.Join(args, " ")
+	filterLower := strings.ToLower(filter)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -477,12 +482,31 @@ func (r *REPL) handleWorkspaces() {
 		_ = json.Unmarshal(result.Output, &workspaces)
 	}
 
+	if filter != "" {
+		filtered := workspaces[:0]
+		for _, ws := range workspaces {
+			name := stringField(ws, "name", "Name")
+			if strings.Contains(strings.ToLower(name), filterLower) {
+				filtered = append(filtered, ws)
+			}
+		}
+		workspaces = filtered
+	}
+
 	if len(workspaces) == 0 {
-		white.Printf("  No workspaces found in %s.\n", r.org)
+		if filter != "" {
+			white.Printf("  No workspaces matching '%s' in %s.\n", filter, r.org)
+		} else {
+			white.Printf("  No workspaces found in %s.\n", r.org)
+		}
 		return
 	}
 
-	waypointTeal.Printf("  Workspaces in %s:\n", r.org)
+	if filter != "" {
+		waypointTeal.Printf("  Workspaces in %s matching '%s':\n", r.org, filter)
+	} else {
+		waypointTeal.Printf("  Workspaces in %s:\n", r.org)
+	}
 	fmt.Println()
 	for _, ws := range workspaces {
 		name := stringField(ws, "name", "Name")
@@ -1191,7 +1215,7 @@ func printHelp() {
 	fmt.Println("  /mode              Show current mode")
 	fmt.Println("  /analyze <run-id>  Risk assessment for a specific run")
 	fmt.Println("  /diagnose <run-id> Categorize a failed run and suggest a fix")
-	fmt.Println("  /workspaces        List all workspaces in the pinned org")
+	fmt.Println("  /workspaces [filter]   List workspaces in the pinned org (optional name filter)")
 	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
