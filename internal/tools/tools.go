@@ -2149,8 +2149,11 @@ func parseVariables(raw []byte) ([]variableEntry, error) {
 	return out, nil
 }
 
-// stacksListCall shells out to `hcptf stack list` and returns the raw JSON
-// array of stacks. Read-only; visible in every mode.
+// stacksListCall shells out to `hcptf stack list` and enriches each stack
+// with deployment_count and health by fanning out parallel
+// `stack deployment list` calls. The base `stack list` payload only includes
+// id/name/project/created — without the fan-out, /stacks would always render
+// "0 deployments" and "Unknown" health. Read-only; visible in every mode.
 func stacksListCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
 	start := time.Now()
 	result := &CallResult{ToolName: "_hcp_tf_stacks_list", Args: args}
@@ -2167,7 +2170,43 @@ func stacksListCall(ctx context.Context, args map[string]string, timeoutSec int)
 		result.Duration = time.Since(start)
 		return result
 	}
-	result.Output = json.RawMessage(raw)
+
+	var stacks []map[string]any
+	if err := json.Unmarshal(raw, &stacks); err != nil {
+		// Pass the raw payload through if it's not the expected shape so the
+		// agent at least sees what hcptf returned.
+		result.Output = json.RawMessage(raw)
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var wg sync.WaitGroup
+	for i := range stacks {
+		stack := stacks[i]
+		stackID := firstStringField(stack, "id", "ID")
+		if stackID == "" {
+			stack["deployment_count"] = 0
+			stack["health"] = "Unknown"
+			continue
+		}
+		wg.Add(1)
+		go func(s map[string]any, id string) {
+			defer wg.Done()
+			deployRaw, derr := fetchHCPTFJSON(ctx, timeoutSec, "stack", "deployment", "list", "-stack-id="+id, "-output=json")
+			deployments := parseStackDeployments(deployRaw, derr, s)
+			s["deployment_count"] = len(deployments)
+			s["health"] = stackHealth(deployments)
+		}(stack, stackID)
+	}
+	wg.Wait()
+
+	out, mErr := json.Marshal(stacks)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
 	result.Duration = time.Since(start)
 	return result
 }
