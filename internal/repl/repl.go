@@ -153,6 +153,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleAnalyze(parts[1:])
 	case "/diagnose":
 		r.handleDiagnose(parts[1:])
+	case "/stacks":
+		r.handleStacks()
 	default:
 		boundaryPink.Printf("Unknown command: %s\n", parts[0])
 		fmt.Println("Type /help for available commands.")
@@ -447,6 +449,86 @@ func (r *REPL) handleAnalyze(args []string) {
 		return
 	}
 	renderAssessment(parseAssessment(result.Output))
+}
+
+// handleStacks implements /stacks by calling _hcp_tf_stacks_list for the
+// pinned org and rendering a one-line-per-stack summary. An empty result is
+// rendered as an explanatory hint about when Stacks are the right tool, with
+// a link to the docs.
+func (r *REPL) handleStacks() {
+	if r.org == "" {
+		boundaryPink.Println("Set /org before running /stacks.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_stacks_list", map[string]string{"org": r.org}, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_stacks_list: %s\n", result.Err.Message)
+		return
+	}
+
+	var stacks []map[string]any
+	if len(result.Output) > 0 {
+		_ = json.Unmarshal(result.Output, &stacks)
+	}
+
+	if len(stacks) == 0 {
+		white.Printf("  No stacks found in %s. Stacks are used for repeated infrastructure across environments or regions.\n", r.org)
+		dimWhite.Println("  Learn more: https://developer.hashicorp.com/terraform/cloud-docs/stacks")
+		return
+	}
+
+	waypointTeal.Printf("  Stacks in %s:\n", r.org)
+	fmt.Println()
+	for _, s := range stacks {
+		name := stringField(s, "name", "Name")
+		project := stringField(s, "project", "Project", "project_name", "ProjectName")
+		count := intField(s, "deployment_count", "DeploymentCount", "deployments", "Deployments")
+		health := stringField(s, "health", "Health")
+		if health == "" {
+			health = "Unknown"
+		}
+		fmt.Print("  • ")
+		boldWhite.Print(name)
+		if project != "" {
+			dimWhite.Printf(" (%s)", project)
+		}
+		fmt.Printf("    %d deployments    ", count)
+		switch health {
+		case "Healthy":
+			waypointTeal.Println(health)
+		case "Degraded":
+			boundaryPink.Println(health)
+		default:
+			dimWhite.Println(health)
+		}
+	}
+}
+
+func stringField(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func intField(m map[string]any, keys ...string) int {
+	for _, k := range keys {
+		if n, ok := toInt(m[k]); ok {
+			return n
+		}
+		if arr, ok := m[k].([]any); ok {
+			return len(arr)
+		}
+	}
+	return 0
 }
 
 func (r *REPL) handleDiagnose(args []string) {
@@ -1071,6 +1153,7 @@ func printHelp() {
 	fmt.Println("  /mode              Show current mode")
 	fmt.Println("  /analyze <run-id>  Risk assessment for a specific run")
 	fmt.Println("  /diagnose <run-id> Categorize a failed run and suggest a fix")
+	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")

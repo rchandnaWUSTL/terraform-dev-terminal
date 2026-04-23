@@ -83,19 +83,20 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Complements the local _hcp_tf_plan_analyze tool with a server-side, always-on analysis layer
 - Requires --apply mode (run task attachment is a mutation)
 
-## v0.9 — Application-Aware Infrastructure Generation
+## v0.9 — Stacks Integration (In Progress)
+- Stack discovery: _hcp_tf_stacks_list lists stacks in the org
+- Stack topology and health: _hcp_tf_stack_describe returns components, deployments, health (Healthy/Degraded/Unknown), and limitations
+- Stacks vs workspaces guidance: _hcp_tf_stack_vs_workspace returns deterministic recommendation based on use-case keywords
+- New /stacks REPL slash command for quick org-wide stack listing
+- System prompt extended with Stacks rules and GA-limitation disclosures (no policy as code, no drift detection, no run tasks, max 20 deployments)
+
+## v0.10 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root
 - Agent scans the directory — infers runtime, dependencies, and resource requirements from package.json, Dockerfile, requirements.txt, etc.
 - Generates full Terraform config to deploy the application: EKS cluster, ECR repo, ALB, IAM roles, VPC
 - Plans against HCP Terraform workspace before proposing
 - Opens a PR to the connected VCS repo
 - Requires v0.6 config generation foundation
-
-## v0.10 — Stacks Integration
-- Point the agent at the HCP Terraform Stacks knowledge base
-- Stack-aware tools: list stacks, describe stack configurations, compare stack deployments
-- Natural language queries about stack topology and dependencies
-- High internal HashiCorp value — Stacks is where enterprise customers are headed
 
 ## v1.0 — Public Launch
 - GoReleaser pipeline with binaries for Mac/Linux/Windows

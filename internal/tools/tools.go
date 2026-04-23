@@ -1419,6 +1419,15 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_pr_create" {
 		return prCreateCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_stacks_list" {
+		return stacksListCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_stack_describe" {
+		return stackDescribeCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_stack_vs_workspace" {
+		return stackVsWorkspaceCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -2140,6 +2149,312 @@ func parseVariables(raw []byte) ([]variableEntry, error) {
 	return out, nil
 }
 
+// stacksListCall shells out to `hcptf stack list` and returns the raw JSON
+// array of stacks. Read-only; visible in every mode.
+func stacksListCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_stacks_list", Args: args}
+
+	if err := require(args, "org"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "stack", "list", "-org="+args["org"], "-output=json")
+	if ferr != nil {
+		result.Err = ferr
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(raw)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// stackDescribeCall fires `stack list`, `stack configuration list`, and
+// `stack deployment list` in parallel and synthesizes a single view of a
+// stack: metadata, configuration count, deployments with status, a computed
+// health label, and the invariant limitations of Stacks today.
+func stackDescribeCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_stack_describe", Args: args}
+
+	if err := require(args, "org", "stack_id"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	stackID := args["stack_id"]
+
+	type fetchResult struct {
+		raw []byte
+		err *ToolError
+	}
+	chStacks := make(chan fetchResult, 1)
+	chConfigs := make(chan fetchResult, 1)
+	chDeploys := make(chan fetchResult, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "stack", "list", "-org="+org, "-output=json")
+		chStacks <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "stack", "configuration", "list", "-stack-id="+stackID, "-output=json")
+		chConfigs <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "stack", "deployment", "list", "-stack-id="+stackID, "-output=json")
+		chDeploys <- fetchResult{raw: raw, err: ferr}
+	}()
+	wg.Wait()
+	rStacks := <-chStacks
+	rConfigs := <-chConfigs
+	rDeploys := <-chDeploys
+
+	if rStacks.err != nil {
+		result.Err = rStacks.err
+		result.Duration = time.Since(start)
+		return result
+	}
+	if rConfigs.err != nil {
+		result.Err = rConfigs.err
+		result.Duration = time.Since(start)
+		return result
+	}
+	// rDeploys.err is tolerated — we fall back to the stack-list entry.
+
+	var stacks []map[string]any
+	if err := json.Unmarshal(rStacks.raw, &stacks); err != nil {
+		result.Err = &ToolError{ErrorCode: "parse_error", Message: "parse stack list: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	var stack map[string]any
+	for _, s := range stacks {
+		if firstStringField(s, "id", "ID") == stackID {
+			stack = s
+			break
+		}
+	}
+	if stack == nil {
+		result.Err = &ToolError{ErrorCode: "not_found", Message: fmt.Sprintf("stack %s not found in org %s", stackID, org)}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	name := firstStringField(stack, "name", "Name")
+	project := firstStringField(stack, "project", "Project", "project_name", "ProjectName")
+
+	var configs []any
+	_ = json.Unmarshal(rConfigs.raw, &configs)
+
+	deployments := parseStackDeployments(rDeploys.raw, rDeploys.err, stack)
+
+	payload := map[string]any{
+		"stack_id":            stackID,
+		"name":                name,
+		"project":             project,
+		"configuration_count": len(configs),
+		"deployments":         deployments,
+		"deployment_count":    len(deployments),
+		"health":              stackHealth(deployments),
+		"limitations": []string{
+			"no policy as code",
+			"no drift detection",
+			"no run tasks",
+		},
+	}
+
+	out, mErr := json.Marshal(payload)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// parseStackDeployments prefers the dedicated `stack deployment list` response
+// and, when that sub-command is unavailable (error or empty payload), falls
+// back to any deployments embedded in the `stack list` entry for this stack.
+func parseStackDeployments(raw []byte, ferr *ToolError, stack map[string]any) []map[string]any {
+	if ferr == nil && len(strings.TrimSpace(string(raw))) > 0 {
+		var arr []map[string]any
+		if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+			out := make([]map[string]any, 0, len(arr))
+			for _, d := range arr {
+				out = append(out, stackDeploymentShape(d))
+			}
+			return out
+		}
+	}
+	if stack != nil {
+		for _, key := range []string{"deployments", "Deployments"} {
+			if arr, ok := stack[key].([]any); ok {
+				out := make([]map[string]any, 0, len(arr))
+				for _, item := range arr {
+					if d, ok := item.(map[string]any); ok {
+						out = append(out, stackDeploymentShape(d))
+					}
+				}
+				return out
+			}
+		}
+	}
+	return []map[string]any{}
+}
+
+func stackDeploymentShape(d map[string]any) map[string]any {
+	return map[string]any{
+		"name":             firstStringField(d, "name", "Name"),
+		"status":           firstStringField(d, "status", "Status"),
+		"deployment_group": firstStringField(d, "deployment_group", "DeploymentGroup", "group", "Group"),
+		"last_updated":     firstStringField(d, "last_updated", "LastUpdated", "updated_at", "UpdatedAt"),
+	}
+}
+
+// stackHealth reduces deployment statuses to Healthy | Degraded | Unknown.
+// Any errored deployment → Degraded; all applied → Healthy; otherwise
+// (empty or mixed/in-flight) → Unknown.
+func stackHealth(deployments []map[string]any) string {
+	if len(deployments) == 0 {
+		return "Unknown"
+	}
+	for _, d := range deployments {
+		status := strings.ToLower(firstStringField(d, "status"))
+		if strings.Contains(status, "error") {
+			return "Degraded"
+		}
+	}
+	for _, d := range deployments {
+		status := strings.ToLower(firstStringField(d, "status"))
+		if status != "applied" {
+			return "Unknown"
+		}
+	}
+	return "Healthy"
+}
+
+// stackKeywords / workspaceKeywords drive _hcp_tf_stack_vs_workspace. Matches
+// are case-insensitive substring checks against the user's use_case. When both
+// buckets match, workspace wins because policy-as-code, drift detection, and
+// run tasks are hard blockers that stacks do not support.
+var stackKeywords = []string{
+	"multiple environments",
+	"repeat",
+	"multi-region",
+	"region",
+	"scale",
+	"orchestrat",
+	"deploy same",
+	"kubernetes",
+	"k8s",
+	"deferred",
+}
+
+var workspaceKeywords = []string{
+	"policy",
+	"sentinel",
+	"opa",
+	"drift",
+	"run task",
+	"explorer",
+	"no-code",
+	"single environment",
+	"simple",
+}
+
+// stackVsWorkspaceCall is a pure reasoning tool — no hcptf call. It classifies
+// a free-text use case by keyword and returns a recommendation plus the stacks
+// limitations that tend to matter for the decision.
+func stackVsWorkspaceCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_stack_vs_workspace", Args: args}
+
+	if err := require(args, "org", "use_case"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	_ = ctx
+	_ = timeoutSec
+
+	useCase := strings.ToLower(args["use_case"])
+
+	matchedStack := []string{}
+	for _, kw := range stackKeywords {
+		if strings.Contains(useCase, kw) {
+			matchedStack = append(matchedStack, kw)
+		}
+	}
+	matchedWorkspace := []string{}
+	for _, kw := range workspaceKeywords {
+		if strings.Contains(useCase, kw) {
+			matchedWorkspace = append(matchedWorkspace, kw)
+		}
+	}
+
+	var recommendation, reasoning string
+	switch {
+	case len(matchedWorkspace) > 0 && len(matchedStack) > 0:
+		recommendation = "workspace"
+		reasoning = fmt.Sprintf("Matched workspace signal(s) %q and stack signal(s) %q. Workspace wins because policy-as-code, drift detection, and run tasks are hard blockers that stacks do not support today.",
+			strings.Join(matchedWorkspace, ", "), strings.Join(matchedStack, ", "))
+	case len(matchedWorkspace) > 0:
+		recommendation = "workspace"
+		reasoning = fmt.Sprintf("Matched workspace signal(s) %q. Use a workspace — stacks do not currently support policy as code, drift detection, or run tasks.",
+			strings.Join(matchedWorkspace, ", "))
+	case len(matchedStack) > 0:
+		recommendation = "stack"
+		reasoning = fmt.Sprintf("Matched stack signal(s) %q. Stacks are designed for repeated infrastructure across environments, regions, or accounts, and for deployment orchestration.",
+			strings.Join(matchedStack, ", "))
+	default:
+		recommendation = "either"
+		reasoning = "No stack- or workspace-specific signals matched the use case. Either will work; pick workspace when you need policy-as-code, drift detection, or run tasks, or stack when you need to repeat infrastructure across environments or regions."
+	}
+
+	payload := map[string]any{
+		"recommendation": recommendation,
+		"reasoning":      reasoning,
+		"use_stack_when": []string{
+			"repeated infrastructure across environments, regions, or accounts",
+			"deployment orchestration / deferred changes",
+			"linked stacks / workload identity",
+		},
+		"use_workspace_when": []string{
+			"policy-as-code required (Sentinel/OPA)",
+			"drift detection required",
+			"run tasks required",
+			"single environment / simple module",
+		},
+		"key_limitations": []string{
+			"Stacks do not support policy as code (Sentinel/OPA)",
+			"Stacks do not support drift detection",
+			"Stacks do not support run tasks",
+			"Maximum 20 deployments per stack",
+		},
+	}
+
+	out, mErr := json.Marshal(payload)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
 // Definitions returns the tool definitions for the Anthropic tool_use API.
 func Definitions() []ToolDef {
 	return []ToolDef{
@@ -2252,6 +2567,41 @@ func Definitions() []ToolDef {
 					"run_id":    map[string]any{"type": "string", "description": "Run ID (run-xxx)"},
 				},
 				"required": []string{"org", "workspace", "run_id"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_stacks_list",
+			Description: "Lists HCP Terraform Stacks for an organization: returns the raw JSON array from `hcptf stack list` with id, name, project, status, and deployment counts per stack. Read-only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org": map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+				},
+				"required": []string{"org"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_stack_describe",
+			Description: "Describes a single HCP Terraform Stack. Fetches stack metadata, configuration list, and deployment list in parallel and returns { stack_id, name, project, configuration_count, deployments[], deployment_count, health (Healthy|Degraded|Unknown), limitations[] }. Health is derived from deployment statuses; limitations always include no policy as code, no drift detection, and no run tasks. Read-only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":      map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"stack_id": map[string]any{"type": "string", "description": "Stack ID (stk-xxx)"},
+				},
+				"required": []string{"org", "stack_id"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_stack_vs_workspace",
+			Description: "Recommends stack vs. workspace for a plain-English use case. Pure reasoning — does not call hcptf. Returns { recommendation: stack|workspace|either, reasoning, use_stack_when[], use_workspace_when[], key_limitations[] }. When policy, drift, or run-task signals appear they override scale signals because those are hard GA blockers for stacks. Call this when a user is deciding whether to model their infrastructure as a Stack or a Workspace.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":      map[string]any{"type": "string", "description": "HCP Terraform organization name (for audit context; not used to query)"},
+					"use_case": map[string]any{"type": "string", "description": "Free-text description of what the user is trying to build"},
+				},
+				"required": []string{"org", "use_case"},
 			},
 		},
 		{
