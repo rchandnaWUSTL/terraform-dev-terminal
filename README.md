@@ -2,7 +2,7 @@
 
 > Terminal co-pilot for HCP Terraform operations.
 
-![Demo](demo-mini.gif)
+![Demo](demo-mini-v2.gif)
 
 ---
 
