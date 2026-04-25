@@ -73,7 +73,22 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Auth errors surface workspace credential check suggestion
 - Policy errors chain _hcp_tf_policy_check automatically
 
-## v0.8 — Run Task Integrations
+## v0.8 — Stacks Integration (Shipped)
+- _hcp_tf_stacks_list: lists all stacks in org with deployment counts and health
+- _hcp_tf_stack_describe: describes stack topology, components, deployments, and GA limitations
+- _hcp_tf_stack_vs_workspace: deterministic recommendation engine for stack vs workspace decisions
+- /stacks slash command with empty-state guidance and docs link
+- Agent surfaces Stacks GA limitations automatically (no policy as code, no drift detection, max 20 deployments)
+- Health computed from deployment run status (Unknown when no runs exist)
+
+## v0.9 — Workspace Lifecycle (Shipped)
+- _hcp_tf_workspace_create: creates a workspace in an org, resolving a project name to a project_id automatically
+- _hcp_tf_workspace_populate: writes HCL to a tempdir, best-effort `terraform init`, uploads a configuration version, and triggers a run in one tool call
+- Direct-apply offer in the config-generation flow — after validation succeeds in --apply mode with a bound workspace, the REPL prompts "Apply this config directly to <ws>?" and routes through the mutation approval gate
+- Archivist one-shot UploadURL handled by capturing the URL from `configversion create` and PUT-ing the tar.gz directly, since hcptf's `configversion upload` cannot re-fetch it
+- Demo environment (prod-api + staging-api in sarah-test-org / zzryan project) provisioned by tfpilot itself as the validation step; see ops/now/v11-workspace-lifecycle-demo-log.md for the durable record
+
+## v0.10 — Run Task Integrations
 - _hcp_tf_runtask_list: list run tasks configured on a workspace
 - _hcp_tf_runtask_attach: deploy an AI-powered run task integration to a workspace
 - Built-in support for two community run task modules:
@@ -83,28 +98,13 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Complements the local _hcp_tf_plan_analyze tool with a server-side, always-on analysis layer
 - Requires --apply mode (run task attachment is a mutation)
 
-## v0.9 — Stacks Integration (Shipped)
-- _hcp_tf_stacks_list: lists all stacks in org with deployment counts and health
-- _hcp_tf_stack_describe: describes stack topology, components, deployments, and GA limitations
-- _hcp_tf_stack_vs_workspace: deterministic recommendation engine for stack vs workspace decisions
-- /stacks slash command with empty-state guidance and docs link
-- Agent surfaces Stacks GA limitations automatically (no policy as code, no drift detection, max 20 deployments)
-- Health computed from deployment run status (Unknown when no runs exist)
-
-## v0.10 — Application-Aware Infrastructure Generation
+## v0.11 — Application-Aware Infrastructure Generation
 - User runs tfpilot in their application repo root
 - Agent scans the directory — infers runtime, dependencies, and resource requirements from package.json, Dockerfile, requirements.txt, etc.
 - Generates full Terraform config to deploy the application: EKS cluster, ECR repo, ALB, IAM roles, VPC
 - Plans against HCP Terraform workspace before proposing
 - Opens a PR to the connected VCS repo
 - Requires v0.6 config generation foundation
-
-## v0.11 — Workspace Lifecycle (Shipped)
-- _hcp_tf_workspace_create: creates a workspace in an org, resolving a project name to a project_id automatically
-- _hcp_tf_workspace_populate: writes HCL to a tempdir, best-effort `terraform init`, uploads a configuration version, and triggers a run in one tool call
-- Direct-apply offer in the config-generation flow — after validation succeeds in --apply mode with a bound workspace, the REPL prompts "Apply this config directly to <ws>?" and routes through the mutation approval gate
-- Archivist one-shot UploadURL handled by capturing the URL from `configversion create` and PUT-ing the tar.gz directly, since hcptf's `configversion upload` cannot re-fetch it
-- Demo environment (prod-api + staging-api in sarah-test-org / zzryan project) provisioned by tfpilot itself as the validation step; see ops/now/v11-workspace-lifecycle-demo-log.md for the durable record
 
 ## v1.0 — Public Launch
 - GoReleaser pipeline with binaries for Mac/Linux/Windows
@@ -120,11 +120,37 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Makes tfpilot accessible to non-terminal users: PMs, security teams, compliance
 - Provider abstraction already in place — the terminal is just one UX on top
 
-## v1.2 — Concierge Mode
+## v1.2 — Proactive Monitoring Mode
 - Proactive agent that surfaces issues without being asked
 - Monitors workspaces for drift, policy failures, cost spikes, expiring credentials
 - Sends alerts via Slack or email when thresholds are crossed
 - Shift from reactive (answer questions) to proactive (surface problems)
 
-## v1.3 — Reserved
-- Placeholder for post-Concierge work; specifics to be defined.
+## v1.3 — Adoption Intelligence
+- Per-workspace usage metrics surfaced inside the REPL ("this workspace has had 47 tfpilot sessions this month")
+- Top questions and workflows identified across the org to guide product priorities
+- Team-level rollout tracking: who has authenticated, who has run applies, who has never used tfpilot
+- Friction report: prompts that required multiple retries, approval gates that got cancelled, errors that went unresolved
+
+## v1.4 — Workspace Intelligence
+- Workspace ownership: who created it, team access, last modified by
+- Staleness analysis: workspaces with no runs in N days, drifted resources, abandoned configs
+- Persona-aware responses: Admin, Engineer, and App Dev personas get different levels of detail and different suggested next actions
+
+## v1.5 — Org Health Audit
+- Terraform version audit across all workspaces: surfaces outdated versions and upgrade paths
+- Known vulnerability checking per Terraform version against the CVE database
+- Module version checking with Terraform Registry integration: flags outdated or deprecated modules
+- Upgrade complexity assessment: estimates effort to upgrade each workspace based on resource count, provider deps, and module usage
+
+## v1.6 — Plan Analyzer v2
+- `how_to_reduce_risk` field per risk factor: concrete, actionable suggestions for making a High or Critical plan safer before applying
+- Registry integration for module version context: surfaces whether a module version in the plan has known issues or a newer release
+- Risk factor explanations written for the operator, not just the model — readable in the REPL without post-processing
+
+## v1.7 — Observability and Metrics
+- Usage analytics: sessions per workspace, tool call frequency, apply success rates
+- Audit log visualization: searchable, filterable view of ~/.tfpilot/audit.log entries
+- Agent call patterns: which tools are invoked together, which prompts lead to applies vs. read-only sessions
+- Cost tracking per workspace: cumulative API spend attributed to workspace context
+- Adoption metrics for internal rollout: active users per week, team coverage, first-use funnel
