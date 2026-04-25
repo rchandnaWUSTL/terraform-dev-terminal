@@ -153,6 +153,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleAnalyze(parts[1:])
 	case "/diagnose":
 		r.handleDiagnose(parts[1:])
+	case "/owner":
+		r.handleOwner()
 	case "/stacks":
 		r.handleStacks()
 	case "/workspaces":
@@ -453,6 +455,97 @@ func (r *REPL) handleAnalyze(args []string) {
 	renderAssessment(parseAssessment(result.Output))
 }
 
+// handleOwner implements /owner by invoking _hcp_tf_workspace_ownership for the
+// pinned org/workspace and printing workspace metadata plus an informational
+// note that team access is not exposed by the hcptf CLI.
+func (r *REPL) handleOwner() {
+	if r.org == "" || r.workspace == "" {
+		boundaryPink.Println("Set /org and /workspace before running /owner.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_workspace_ownership", map[string]string{
+		"org":       r.org,
+		"workspace": r.workspace,
+	}, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_workspace_ownership: %s\n", result.Err.Message)
+		return
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(result.Output, &m); err != nil {
+		boundaryPink.Printf("  ✗ parse error: %s\n", err.Error())
+		return
+	}
+
+	createdAt, _ := m["created_at"].(string)
+	updatedAt, _ := m["last_updated"].(string)
+	vcsRepo, _ := m["vcs_repo"].(string)
+	note, _ := m["team_access_note"].(string)
+
+	bold.Printf("  Ownership of %s:\n", r.workspace)
+	fmt.Println()
+	white.Printf("    Created: %s\n", humanizeRelative(createdAt))
+	white.Printf("    Last updated: %s\n", humanizeRelative(updatedAt))
+	if vcsRepo != "" {
+		white.Printf("    VCS repo: %s\n", vcsRepo)
+	} else {
+		white.Println("    VCS repo: not connected")
+	}
+	if note != "" {
+		fmt.Println()
+		dimWhite.Printf("    Team access: %s\n", note)
+	}
+}
+
+// humanizeRelative converts an RFC3339 timestamp into a coarse "X units ago"
+// string. Returns "unknown" on parse failure or empty input.
+func humanizeRelative(iso string) string {
+	if iso == "" {
+		return "unknown"
+	}
+	t, err := time.Parse(time.RFC3339, iso)
+	if err != nil {
+		return iso
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		n := int(d / time.Minute)
+		return fmt.Sprintf("%d minute%s ago", n, plural(n))
+	case d < 24*time.Hour:
+		n := int(d / time.Hour)
+		return fmt.Sprintf("%d hour%s ago", n, plural(n))
+	case d < 7*24*time.Hour:
+		n := int(d / (24 * time.Hour))
+		return fmt.Sprintf("%d day%s ago", n, plural(n))
+	case d < 30*24*time.Hour:
+		n := int(d / (7 * 24 * time.Hour))
+		return fmt.Sprintf("%d week%s ago", n, plural(n))
+	case d < 365*24*time.Hour:
+		n := int(d / (30 * 24 * time.Hour))
+		return fmt.Sprintf("%d month%s ago", n, plural(n))
+	default:
+		n := int(d / (365 * 24 * time.Hour))
+		return fmt.Sprintf("%d year%s ago", n, plural(n))
+	}
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
 // handleWorkspaces implements /workspaces by calling _hcp_tf_workspaces_list
 // for the pinned org and rendering a one-line-per-workspace summary. When a
 // filter argument is supplied, only workspaces whose name contains the filter
@@ -748,6 +841,7 @@ type assessmentResult struct {
 	failedPolicies []string
 	recommendation string
 	reason         string
+	howToReduceRisk []string
 }
 
 type assessmentFactor struct {
@@ -839,6 +933,13 @@ func parseAssessment(raw json.RawMessage) assessmentResult {
 			}
 		}
 	}
+	if hr, ok := m["how_to_reduce_risk"].([]any); ok {
+		for _, r := range hr {
+			if s, ok := r.(string); ok {
+				a.howToReduceRisk = append(a.howToReduceRisk, s)
+			}
+		}
+	}
 	return a
 }
 
@@ -907,6 +1008,14 @@ func renderAssessment(a assessmentResult) {
 			white.Printf(" — %s", a.reason)
 		}
 		fmt.Println()
+	}
+
+	if len(a.howToReduceRisk) > 0 {
+		fmt.Println()
+		white.Println("  To reduce risk:")
+		for _, s := range a.howToReduceRisk {
+			white.Printf("    • %s\n", s)
+		}
 	}
 }
 
@@ -1284,6 +1393,7 @@ func printHelp() {
 	fmt.Println("  /mode              Show current mode")
 	fmt.Println("  /analyze <run-id>  Risk assessment for a specific run")
 	fmt.Println("  /diagnose <run-id> Categorize a failed run and suggest a fix")
+	fmt.Println("  /owner             Show metadata and VCS info for the pinned workspace")
 	fmt.Println("  /workspaces [filter]   List workspaces in the pinned org (optional name filter)")
 	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
 	fmt.Println("  /reset             Clear conversation history")

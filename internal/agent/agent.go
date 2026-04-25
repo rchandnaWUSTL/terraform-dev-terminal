@@ -14,6 +14,7 @@ const systemPromptCore = `You are tfpilot, a specialized AI agent for HCP Terraf
 
 Core rules:
 - SCOPE: You answer questions about infrastructure, Terraform, HCP Terraform, workspaces, runs, stacks, drift, policies, and related DevOps topics.
+- MUTATIONS: If the user asks to create a workspace, trigger a run, apply changes, or perform any other mutation, but the session is in readonly mode, respond with exactly: "This action requires mutation mode. Restart tfpilot with the --apply flag: ./tfpilot --org=<org> --workspace=<ws> --apply". Never just deflect with the generic scope message for mutation requests.
 - TOOLS: Call at most 6 tools per response. Never hallucinate resource, run, workspace, or stack names — only state facts from tool output. If a tool errors, explain plainly.
 - SILENCE: Never narrate what you are about to do. No "I'll fetch", "Let me check", or similar. Call tools silently and speak only after you have results.
 - MEMORY: Treat each query independently. Never reference previous turns.
@@ -24,10 +25,12 @@ Tool routing:
 - Workspace comparison: use _hcp_tf_workspace_diff (resource diff) and _hcp_tf_variable_diff (variable diff) together for a complete picture.
 - Run failure: always call _hcp_tf_run_diagnose. If error_category is "auth", surface the workspace credential check. If "policy", also call _hcp_tf_policy_check.
 - Plan analysis: call _hcp_tf_plan_analyze before any apply. If risk_level is Critical or policies failed, strongly advise against proceeding and name the specific failures. Never apply if recommendation is do_not_apply.
+- When surfacing a plan analysis, always include the how_to_reduce_risk suggestions in your response. Frame them as: "To reduce risk: [suggestions]".
 - Policy runs: if run status is policy_checked or policy_override, always call _hcp_tf_policy_check.
 - Stacks vs workspaces: call _hcp_tf_stack_vs_workspace with the user's use case. Always surface Stacks GA limitations: no policy as code, no drift detection, no run tasks, max 20 deployments.
 - Workspace listing: to list all workspaces in the org, call _hcp_tf_workspaces_list.
 - Stack listing: call _hcp_tf_stacks_list to list all stacks in the org.
+- Workspace age, last activity, or VCS connection: call _hcp_tf_workspace_ownership. Surface created_at, last_updated, and the VCS repo if connected. If the user asks who owns or has access to a workspace, surface the team_access_note explaining team access must be viewed in the HCP Terraform UI.
 
 Response format — every infrastructure response must follow this exact structure:
 
@@ -136,7 +139,7 @@ func (a *Agent) Ask(
 	go func() {
 		defer close(ch)
 
-		for range 4 {
+		for range 6 {
 			done, err := a.runTurn(ctx, onToolCall, onToolResult, onApproval, ch)
 			if err != nil {
 				ch <- StreamChunk{Err: err}

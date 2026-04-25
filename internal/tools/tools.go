@@ -391,6 +391,9 @@ func planAnalyzeCall(ctx context.Context, args map[string]string, timeoutSec int
 			"failed_policies": policy.failedNames,
 		}
 	}
+	if reduction := riskReductionSuggestions(level, factors, plan); len(reduction) > 0 {
+		payload["how_to_reduce_risk"] = reduction
+	}
 
 	out, mErr := json.Marshal(payload)
 	if mErr != nil {
@@ -972,6 +975,56 @@ func decodePolicyChecks(raw []byte, ferr *ToolError) (policyCheckSummary, bool) 
 // group, database, networking, load balancer) so the REPL and agent can
 // surface the specific reasons a plan is risky. Returns the factors plus a
 // "highest risk" resource list drawn from the most severe category that fired.
+// riskReductionSuggestions builds a deduped, capped list of concrete actions a
+// user can take to lower the assessed risk before applying. Suggestions are
+// derived from the detected risk-factor names and the destruction count in
+// blast_radius. Returns nil when no suggestions apply (caller omits the field).
+func riskReductionSuggestions(level string, factors []map[string]any, plan planCounts) []string {
+	const cap = 4
+	out := []string{}
+	add := func(s string) {
+		if len(out) >= cap {
+			return
+		}
+		for _, existing := range out {
+			if existing == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	for _, f := range factors {
+		name, _ := f["factor"].(string)
+		if strings.Contains(name, "IAM") {
+			add("Review IAM permission boundaries and least-privilege policies before applying")
+			add("Test IAM changes in a non-prod account first")
+		}
+		if strings.Contains(name, "Security group") {
+			add("Review inbound/outbound rules against your security baseline before applying")
+			add("Apply security group changes during a maintenance window")
+		}
+		if strings.Contains(name, "Networking") {
+			add("Verify route tables and subnet associations in a staging environment first")
+			add("Coordinate with on-call before applying networking changes")
+		}
+		if strings.Contains(name, "Database") {
+			add("Ensure a database snapshot exists before applying")
+			add("Test the change against a read replica first")
+		}
+	}
+	if plan.destructions > 0 {
+		add("Use terraform plan -target to apply non-destructive changes first")
+		add("Take a state backup before applying: terraform state pull > backup.tfstate")
+	}
+	if len(out) == 0 && level == "Low" {
+		return []string{"No specific risk reduction needed — proceed with normal review"}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func classifyRiskFactors(runResources []runResourceEntry, inventory []workspaceResource) ([]map[string]any, []string) {
 	type group struct {
 		factor    string
@@ -1407,6 +1460,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	}
 	if name == "_hcp_tf_workspace_describe" {
 		return workspaceDescribeCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_workspace_ownership" {
+		return workspaceOwnershipCall(ctx, args, timeoutSec)
 	}
 	if name == "_hcp_tf_variable_diff" {
 		return variableDiffCall(ctx, args, timeoutSec)
@@ -2239,6 +2295,127 @@ func workspaceDescribeCall(ctx context.Context, args map[string]string, timeoutS
 	return result
 }
 
+// workspaceOwnershipCall returns workspace metadata (created_at, last_updated,
+// vcs_repo) plus a flag noting that workspace-scoped team access is not exposed
+// by the hcptf CLI. Read-only; reuses fetchWorkspaceRead.
+func workspaceOwnershipCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_workspace_ownership", Args: args}
+
+	if err := require(args, "org", "workspace"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	workspace := args["workspace"]
+
+	raw, ferr := fetchWorkspaceRead(ctx, org, workspace, timeoutSec)
+	if ferr != nil {
+		result.Err = ferr
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	createdAt, updatedAt := extractWorkspaceTimestamps(raw)
+	vcsRepo := extractVCSRepoIdentifier(raw)
+
+	payload := map[string]any{
+		"workspace":             workspace,
+		"created_at":            createdAt,
+		"last_updated":          updatedAt,
+		"team_access_available": false,
+		"team_access_note":      "Workspace-scoped team access is not exposed by the hcptf CLI. View team access in the HCP Terraform UI.",
+	}
+	if vcsRepo != "" {
+		payload["vcs_repo"] = vcsRepo
+	} else {
+		payload["vcs_repo"] = nil
+	}
+
+	out, mErr := json.Marshal(payload)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// extractWorkspaceTimestamps pulls created/updated ISO strings out of a
+// `hcptf workspace read -output=json` payload. The CLI's JSON shape is not
+// fully documented; probe both kebab-case (HCP API style) and Go-mapped names.
+// Returns empty strings when neither shape matches.
+func extractWorkspaceTimestamps(raw []byte) (createdAt, updatedAt string) {
+	if len(raw) == 0 {
+		return "", ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return "", ""
+	}
+	pickString := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := m[k].(string); ok && v != "" {
+				return v
+			}
+		}
+		// Probe a nested attributes block too (JSON:API style).
+		if attrs, ok := m["attributes"].(map[string]any); ok {
+			for _, k := range keys {
+				if v, ok := attrs[k].(string); ok && v != "" {
+					return v
+				}
+			}
+		}
+		return ""
+	}
+	createdAt = pickString("CreatedAt", "created-at", "created_at", "createdAt")
+	updatedAt = pickString("UpdatedAt", "updated-at", "updated_at", "updatedAt")
+	return createdAt, updatedAt
+}
+
+// extractVCSRepoIdentifier pulls the VCS repo identifier (e.g. "acme/infra")
+// out of a `workspace read` payload. Returns "" when the workspace is not
+// connected to a VCS or when the field shape is unrecognized.
+func extractVCSRepoIdentifier(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	probe := func(obj map[string]any) string {
+		if obj == nil {
+			return ""
+		}
+		for _, k := range []string{"vcs-repo", "vcs_repo", "VcsRepo", "VCSRepo"} {
+			node, ok := obj[k].(map[string]any)
+			if !ok {
+				continue
+			}
+			for _, idKey := range []string{"identifier", "Identifier", "display-identifier", "DisplayIdentifier"} {
+				if v, ok := node[idKey].(string); ok && v != "" {
+					return v
+				}
+			}
+		}
+		return ""
+	}
+	if id := probe(m); id != "" {
+		return id
+	}
+	if attrs, ok := m["attributes"].(map[string]any); ok {
+		if id := probe(attrs); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
 // fetchWorkspaceRead shells out to `hcptf workspace read` and returns the raw
 // JSON body. Errors are normalized the same way fetchWorkspaceResources does.
 func fetchWorkspaceRead(ctx context.Context, org, workspace string, timeoutSec int) ([]byte, *ToolError) {
@@ -2946,6 +3123,18 @@ func Definitions() []ToolDef {
 		{
 			Name:        "_hcp_tf_workspace_describe",
 			Description: "Returns workspace metadata merged with the actual resource inventory: workspace read fields under `workspace`, the full resource list under `resources`, distinct `resource_types`, and a total `resource_count`.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
+				},
+				"required": []string{"org", "workspace"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_workspace_ownership",
+			Description: "Returns workspace metadata: created_at, last_updated, vcs_repo (or null if not connected). Also returns team_access_available=false and a note explaining workspace-scoped team access is not exposed by the hcptf CLI. Read-only.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
