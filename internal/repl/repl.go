@@ -155,6 +155,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleDiagnose(parts[1:])
 	case "/owner":
 		r.handleOwner()
+	case "/deps":
+		r.handleDeps()
 	case "/stacks":
 		r.handleStacks()
 	case "/audit":
@@ -499,9 +501,9 @@ func (r *REPL) handleAnalyze(args []string) {
 	renderAssessment(parseAssessment(result.Output))
 }
 
-// handleOwner implements /owner by invoking _hcp_tf_workspace_ownership for the
-// pinned org/workspace and printing workspace metadata plus an informational
-// note that team access is not exposed by the hcptf CLI.
+// handleOwner implements /owner by invoking _hcp_tf_workspace_ownership for
+// the pinned org/workspace and printing inferred owner, team access, last
+// modifier, description, and timestamps.
 func (r *REPL) handleOwner() {
 	if r.org == "" || r.workspace == "" {
 		boundaryPink.Println("Set /org and /workspace before running /owner.")
@@ -528,13 +530,25 @@ func (r *REPL) handleOwner() {
 		return
 	}
 
+	inferred, _ := m["inferred_owner"].(string)
 	createdAt, _ := m["created_at"].(string)
 	updatedAt, _ := m["last_updated"].(string)
 	vcsRepo, _ := m["vcs_repo"].(string)
-	note, _ := m["team_access_note"].(string)
+	description, _ := m["description"].(string)
+	teamAccessRaw, _ := m["team_access"].([]any)
+	teamNote, _ := m["team_access_note"].(string)
+	lastModNote, _ := m["last_modified_by_note"].(string)
+	lastMod, _ := m["last_modified_by"].(map[string]any)
 
 	bold.Printf("  Ownership of %s:\n", r.workspace)
 	fmt.Println()
+	if inferred == "" {
+		inferred = "unknown"
+	}
+	white.Printf("    Inferred owner: %s\n", inferred)
+	if description != "" {
+		white.Printf("    Description: %s\n", description)
+	}
 	white.Printf("    Created: %s\n", humanizeRelative(createdAt))
 	white.Printf("    Last updated: %s\n", humanizeRelative(updatedAt))
 	if vcsRepo != "" {
@@ -542,9 +556,123 @@ func (r *REPL) handleOwner() {
 	} else {
 		white.Println("    VCS repo: not connected")
 	}
+
+	fmt.Println()
+	if lastMod != nil {
+		username, _ := lastMod["username"].(string)
+		email, _ := lastMod["email"].(string)
+		if email != "" {
+			white.Printf("    Last modified by: %s <%s>\n", username, email)
+		} else if username != "" {
+			white.Printf("    Last modified by: %s\n", username)
+		}
+	} else if lastModNote != "" {
+		dimWhite.Printf("    Last modified by: %s\n", lastModNote)
+	}
+
+	if len(teamAccessRaw) > 0 {
+		fmt.Println()
+		white.Println("    Team access:")
+		for _, t := range teamAccessRaw {
+			entry, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			team, _ := entry["team"].(string)
+			access, _ := entry["access"].(string)
+			white.Printf("      • %s — %s\n", team, access)
+		}
+	} else if teamNote != "" {
+		fmt.Println()
+		dimWhite.Printf("    Team access: %s\n", teamNote)
+	}
+}
+
+// handleDeps implements /deps by invoking _hcp_tf_workspace_dependencies for
+// the pinned workspace and rendering its depends_on / depended_by sections
+// with a re-apply warning when downstream consumers exist.
+func (r *REPL) handleDeps() {
+	if r.org == "" || r.workspace == "" {
+		boundaryPink.Println("Set /org and /workspace before running /deps.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_workspace_dependencies", map[string]string{
+		"org":       r.org,
+		"workspace": r.workspace,
+	}, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_workspace_dependencies: %s\n", result.Err.Message)
+		return
+	}
+
+	var m map[string]any
+	if err := json.Unmarshal(result.Output, &m); err != nil {
+		boundaryPink.Printf("  ✗ parse error: %s\n", err.Error())
+		return
+	}
+
+	dependsOn, _ := m["depends_on"].([]any)
+	dependedBy, _ := m["depended_by"].([]any)
+	depth, _ := m["dependency_depth"].(float64)
+	note, _ := m["note"].(string)
+
+	bold.Printf("  Dependencies — %s\n", r.workspace)
+
+	if len(dependsOn) == 0 && len(dependedBy) == 0 {
+		fmt.Println()
+		white.Println("    No cross-workspace dependencies detected.")
+		dimWhite.Println("    This workspace appears to be self-contained.")
+		return
+	}
+
+	if len(dependsOn) > 0 {
+		fmt.Println()
+		white.Println("    This workspace depends on:")
+		for _, d := range dependsOn {
+			entry, ok := d.(map[string]any)
+			if !ok {
+				continue
+			}
+			ws, _ := entry["workspace"].(string)
+			outs, _ := entry["outputs_consumed"].([]any)
+			if len(outs) > 0 {
+				names := make([]string, 0, len(outs))
+				for _, o := range outs {
+					if s, ok := o.(string); ok {
+						names = append(names, s)
+					}
+				}
+				white.Printf("      • %s — consumes outputs: %s\n", ws, strings.Join(names, ", "))
+			} else {
+				white.Printf("      • %s\n", ws)
+			}
+		}
+	}
+
+	if len(dependedBy) > 0 {
+		fmt.Println()
+		white.Println("    This workspace is depended on by:")
+		for _, d := range dependedBy {
+			entry, ok := d.(map[string]any)
+			if !ok {
+				continue
+			}
+			ws, _ := entry["workspace"].(string)
+			white.Printf("      • %s — would need re-apply if this workspace changes\n", ws)
+		}
+	}
+
+	fmt.Println()
+	white.Printf("    Dependency depth: %d\n", int(depth))
 	if note != "" {
 		fmt.Println()
-		dimWhite.Printf("    Team access: %s\n", note)
+		dimWhite.Printf("    %s\n", note)
 	}
 }
 
@@ -2031,7 +2159,8 @@ func printHelp() {
 	fmt.Println("  /mode              Show current mode")
 	fmt.Println("  /analyze <run-id>  Risk assessment for a specific run")
 	fmt.Println("  /diagnose <run-id> Categorize a failed run and suggest a fix")
-	fmt.Println("  /owner             Show metadata and VCS info for the pinned workspace")
+	fmt.Println("  /owner             Show inferred owner, team access, and metadata for the pinned workspace")
+	fmt.Println("  /deps              Show cross-workspace dependency graph for the pinned workspace")
 	fmt.Println("  /workspaces [filter]   List workspaces in the pinned org (optional name filter)")
 	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
 	fmt.Println("  /audit             Terraform version + CVE audit across all workspaces")

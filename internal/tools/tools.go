@@ -1674,6 +1674,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_incident_summary" {
 		return incidentSummaryCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_workspace_dependencies" {
+		return workspaceDependenciesCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -2463,9 +2466,12 @@ func workspaceDescribeCall(ctx context.Context, args map[string]string, timeoutS
 	return result
 }
 
-// workspaceOwnershipCall returns workspace metadata (created_at, last_updated,
-// vcs_repo) plus a flag noting that workspace-scoped team access is not exposed
-// by the hcptf CLI. Read-only; reuses fetchWorkspaceRead.
+// workspaceOwnershipCall returns workspace ownership and metadata. It merges
+// `hcptf workspace read` (timestamps, VCS repo, description, current run ID),
+// `hcptf team access list` (team-level permissions), and the HCP Terraform
+// HTTP API GET /runs/<id>?include=created_by (last modifier user attribution).
+// inferred_owner is the admin team's name when one exists, otherwise the last
+// modifier's username, otherwise "unknown". Read-only.
 func workspaceOwnershipCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
 	start := time.Now()
 	result := &CallResult{ToolName: "_hcp_tf_workspace_ownership", Args: args}
@@ -2487,18 +2493,41 @@ func workspaceOwnershipCall(ctx context.Context, args map[string]string, timeout
 
 	createdAt, updatedAt := extractWorkspaceTimestamps(raw)
 	vcsRepo := extractVCSRepoIdentifier(raw)
+	wsID := extractWorkspaceID(raw)
+	description := extractWorkspaceDescription(raw)
+	currentRunID := extractCurrentRunID(raw)
+
+	teamAccess, teamNote := fetchTeamAccess(ctx, wsID, timeoutSec)
+	lastMod, lastModNote := fetchLastModifiedBy(ctx, currentRunID, timeoutSec)
 
 	payload := map[string]any{
-		"workspace":             workspace,
-		"created_at":            createdAt,
-		"last_updated":          updatedAt,
-		"team_access_available": false,
-		"team_access_note":      "Workspace-scoped team access is not exposed by the hcptf CLI. View team access in the HCP Terraform UI.",
+		"workspace":          workspace,
+		"org":                org,
+		"created_at":         createdAt,
+		"created_at_human":   humanizeISO(createdAt),
+		"last_updated":       updatedAt,
+		"last_updated_human": humanizeISO(updatedAt),
+		"team_access":        teamAccess,
+		"team_access_note":   teamNote,
+		"inferred_owner":     computeInferredOwner(teamAccess, lastMod),
 	}
 	if vcsRepo != "" {
 		payload["vcs_repo"] = vcsRepo
 	} else {
 		payload["vcs_repo"] = nil
+	}
+	if description != "" {
+		payload["description"] = description
+	} else {
+		payload["description"] = nil
+	}
+	if lastMod != nil {
+		payload["last_modified_by"] = lastMod
+	} else {
+		payload["last_modified_by"] = nil
+	}
+	if lastModNote != "" {
+		payload["last_modified_by_note"] = lastModNote
 	}
 
 	out, mErr := json.Marshal(payload)
@@ -2510,6 +2539,222 @@ func workspaceOwnershipCall(ctx context.Context, args map[string]string, timeout
 	result.Output = json.RawMessage(out)
 	result.Duration = time.Since(start)
 	return result
+}
+
+// extractWorkspaceID pulls the workspace ID (ws-XXX) out of a `hcptf workspace
+// read -output=json` payload. Probes both Go-mapped (`ID`) and JSON:API (`id`,
+// nested `attributes`) shapes; returns "" on miss.
+func extractWorkspaceID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	if id := firstStringField(m, "ID", "id", "workspace_id", "WorkspaceID"); id != "" {
+		return id
+	}
+	if attrs, ok := m["attributes"].(map[string]any); ok {
+		if id := firstStringField(attrs, "id", "ID"); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// extractWorkspaceDescription pulls the description string out of a workspace
+// read payload. Returns "" when absent or empty.
+func extractWorkspaceDescription(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	if d := firstStringField(m, "Description", "description"); d != "" {
+		return d
+	}
+	if attrs, ok := m["attributes"].(map[string]any); ok {
+		if d := firstStringField(attrs, "description", "Description"); d != "" {
+			return d
+		}
+	}
+	return ""
+}
+
+// extractCurrentRunID pulls the workspace's most recent run ID from the
+// workspace read payload. Returns "" when no recent run exists.
+func extractCurrentRunID(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	if id := firstStringField(m, "CurrentRunID", "current-run-id", "current_run_id"); id != "" {
+		return id
+	}
+	if attrs, ok := m["attributes"].(map[string]any); ok {
+		if id := firstStringField(attrs, "current-run-id", "current_run_id"); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// userInfo carries the username + email for the most recent run's creator.
+// Email is best-effort: HCP Terraform's runs?include=created_by often omits it
+// when the caller lacks the right scope.
+type userInfo struct {
+	Username string `json:"username"`
+	Email    string `json:"email,omitempty"`
+}
+
+// fetchTeamAccess shells out to `hcptf team access list -workspace-id=<id>`
+// and parses the JSON response. The CLI prints "No team access found" (exit
+// 0) when the workspace has no team-level permissions defined — that is
+// returned as (empty, note) rather than as an error so the caller can still
+// emit a useful payload.
+func fetchTeamAccess(ctx context.Context, wsID string, timeoutSec int) ([]map[string]string, string) {
+	if wsID == "" {
+		return []map[string]string{}, "Workspace ID unavailable; team access could not be queried."
+	}
+	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "team", "access", "list", "-workspace-id="+wsID, "-output=json")
+	if ferr != nil {
+		return []map[string]string{}, "Team access could not be retrieved: " + ferr.Message
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || strings.Contains(trimmed, "No team access found") {
+		return []map[string]string{}, "No team-level access defined; check workspace permissions in the HCP Terraform UI."
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return []map[string]string{}, "Team access response was not parseable JSON."
+	}
+	out := make([]map[string]string, 0, len(arr))
+	for _, item := range arr {
+		teamName := firstStringField(item, "TeamName", "team_name", "team-name", "team", "Team")
+		if teamName == "" {
+			if t, ok := item["Team"].(map[string]any); ok {
+				teamName = firstStringField(t, "Name", "name")
+			}
+		}
+		access := firstStringField(item, "Access", "access", "permission", "Permission")
+		if teamName == "" && access == "" {
+			continue
+		}
+		out = append(out, map[string]string{"team": teamName, "access": access})
+	}
+	if len(out) == 0 {
+		return []map[string]string{}, "Team access list returned no recognizable entries."
+	}
+	return out, "Team access sourced from HCP Terraform workspace permissions."
+}
+
+// fetchLastModifiedBy resolves the user who created the workspace's most
+// recent run via GET /api/v2/runs/<id>?include=created_by. Returns nil with a
+// note when no run exists, the API token is missing, the API call fails, or
+// the run was triggered without user attribution (e.g. via an org-level API
+// token).
+func fetchLastModifiedBy(ctx context.Context, runID string, timeoutSec int) (*userInfo, string) {
+	if runID == "" {
+		return nil, "No recent run found for this workspace."
+	}
+	token := readTFCToken()
+	if token == "" {
+		return nil, "Last modifier could not be resolved: no HCP Terraform API token available locally."
+	}
+	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet,
+		"https://app.terraform.io/api/v2/runs/"+runID+"?include=created_by", nil)
+	if err != nil {
+		return nil, "Last modifier lookup failed: " + err.Error()
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/vnd.api+json")
+	req.Header.Set("User-Agent", "tfpilot/2.1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, "Last modifier lookup failed: " + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Sprintf("Last modifier lookup failed: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "Last modifier lookup failed: " + err.Error()
+	}
+	var doc struct {
+		Data struct {
+			Relationships struct {
+				CreatedBy struct {
+					Data *struct {
+						ID   string `json:"id"`
+						Type string `json:"type"`
+					} `json:"data"`
+				} `json:"created-by"`
+			} `json:"relationships"`
+		} `json:"data"`
+		Included []struct {
+			ID         string `json:"id"`
+			Type       string `json:"type"`
+			Attributes struct {
+				Username string `json:"username"`
+				Email    string `json:"email"`
+			} `json:"attributes"`
+		} `json:"included"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, "Last modifier response was not parseable JSON."
+	}
+	if doc.Data.Relationships.CreatedBy.Data == nil {
+		return nil, "Last run was triggered without user attribution (likely an org-level API token)."
+	}
+	wantID := doc.Data.Relationships.CreatedBy.Data.ID
+	for _, inc := range doc.Included {
+		if inc.Type == "users" && inc.ID == wantID {
+			return &userInfo{Username: inc.Attributes.Username, Email: inc.Attributes.Email}, ""
+		}
+	}
+	return nil, "Last modifier user record could not be resolved from the run API response."
+}
+
+// computeInferredOwner picks the most defensible owner signal: an admin team
+// when one exists (groups outrank individuals for ownership purposes), else
+// the most recent modifier's username, else "unknown".
+func computeInferredOwner(teamAccess []map[string]string, lastMod *userInfo) string {
+	for _, t := range teamAccess {
+		if strings.EqualFold(t["access"], "admin") && t["team"] != "" {
+			return t["team"]
+		}
+	}
+	if lastMod != nil && lastMod.Username != "" {
+		return lastMod.Username
+	}
+	return "unknown"
+}
+
+// humanizeISO parses an ISO-8601 timestamp and returns a relative string
+// ("3 days ago"). Returns "" for empty input or parse failure so callers can
+// drop the field cleanly.
+func humanizeISO(iso string) string {
+	if iso == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, iso)
+	if err != nil {
+		t2, err2 := time.Parse(time.RFC3339Nano, iso)
+		if err2 != nil {
+			return ""
+		}
+		t = t2
+	}
+	return humanRelative(t)
 }
 
 // extractWorkspaceTimestamps pulls created/updated ISO strings out of a
@@ -4985,7 +5230,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_workspace_ownership",
-			Description: "Returns workspace metadata: created_at, last_updated, vcs_repo (or null if not connected). Also returns team_access_available=false and a note explaining workspace-scoped team access is not exposed by the hcptf CLI. Read-only.",
+			Description: "Returns workspace ownership and metadata: created_at and last_updated (with *_human relative strings), vcs_repo (or null), description, team_access (array of {team, access}) with team_access_note, last_modified_by ({username, email} or null) with last_modified_by_note, inferred_owner (the admin team's name, else last modifier's username, else 'unknown'). Read-only.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -4993,6 +5238,18 @@ func Definitions() []ToolDef {
 					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
 				},
 				"required": []string{"org", "workspace"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_workspace_dependencies",
+			Description: "Maps cross-workspace dependencies by walking each workspace's state file for terraform_remote_state data sources. With `workspace`, returns per-workspace { depends_on[], depended_by[], dependency_depth, is_root, is_leaf, note }. Without `workspace`, returns the full org-wide dependency_graph with roots, leaves, and total_dependency_edges. Empty graphs are returned with an explanatory note (not an error) when no terraform_remote_state references exist. Read-only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name. Optional — omit for an org-wide dependency map."},
+				},
+				"required": []string{"org"},
 			},
 		},
 		{
