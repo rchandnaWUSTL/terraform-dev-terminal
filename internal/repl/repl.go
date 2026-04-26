@@ -1,7 +1,6 @@
 package repl
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -63,9 +62,7 @@ func New(cfg *config.Config, prov provider.Provider, org, workspace string) *REP
 	}
 }
 
-// openReadline builds a fresh readline instance. readYes closes and reopens
-// around the approval prompt so a plain bufio.Scanner read on os.Stdin is not
-// racing readline's internal Terminal goroutine for input bytes.
+// openReadline builds a fresh readline instance for the main loop.
 func (r *REPL) openReadline() error {
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          cyan.Sprint("hcp-tf> "),
@@ -401,31 +398,29 @@ func (r *REPL) highConfirm(args map[string]string, action string) bool {
 	return true
 }
 
-// readYes suspends readline while prompting, so input goes to this scanner
-// instead of being swallowed by readline's background Terminal goroutine.
-// chzyer/readline v1.5.1 has no Pause/Resume, so we close the instance and
-// reopen it once the user has answered.
 func (r *REPL) readYes() bool {
 	return r.readLine() == "yes"
 }
 
-// readLine captures a single line of input at an approval prompt. Like
-// readYes, it closes readline for the duration of the read so input is not
-// lost to the background Terminal goroutine.
+// readLine captures a single line of input at an approval prompt by reusing
+// the existing readline instance with a temporary prompt. Closing readline
+// here does not work: chzyer/readline's CancelableStdin goroutine holds a
+// pending blocking Read on os.Stdin that Close() cannot interrupt, so any
+// bufio.Scanner / fmt.Scanln read on os.Stdin races the still-blocked
+// goroutine for the user's keystrokes — the goroutine wins and the prompt
+// appears frozen. Reusing the readline instance keeps a single owner of
+// stdin and eliminates the race entirely.
 func (r *REPL) readLine() string {
-	r.closeReadline()
-	defer func() {
-		if err := r.openReadline(); err != nil {
-			boundaryPink.Printf("  ✗ Failed to reopen readline: %v\n", err)
-		}
-	}()
-
-	fmt.Print("  > ")
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
+	if r.rl == nil {
 		return ""
 	}
-	return strings.TrimSpace(scanner.Text())
+	r.rl.SetPrompt("  > ")
+	defer r.rl.SetPrompt(cyan.Sprint("hcp-tf> "))
+	line, err := r.rl.Readline()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(line)
 }
 
 // handleAnalyze implements /analyze <run-id> by invoking _hcp_tf_plan_analyze
