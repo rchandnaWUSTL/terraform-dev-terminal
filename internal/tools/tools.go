@@ -1514,6 +1514,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_upgrade_preview" {
 		return upgradePreviewCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_drift_detect" {
+		return driftDetectCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -1590,8 +1593,6 @@ func buildArgs(toolName string, args map[string]string) ([]string, error) {
 	switch toolName {
 	case "_hcp_tf_runs_list_recent":
 		return runsListRecent(args)
-	case "_hcp_tf_drift_detect":
-		return driftDetect(args)
 	case "_hcp_tf_policy_check":
 		return policyCheck(args)
 	case "_hcp_tf_plan_summary":
@@ -1623,17 +1624,6 @@ func runsListRecent(args map[string]string) ([]string, error) {
 	return []string{"run", "list",
 		"-org=" + args["org"],
 		"-workspace=" + args["workspace"],
-		"-output=json",
-	}, nil
-}
-
-func driftDetect(args map[string]string) ([]string, error) {
-	if err := require(args, "org", "workspace"); err != nil {
-		return nil, err
-	}
-	return []string{"assessmentresult", "list",
-		"-org=" + args["org"],
-		"-name=" + args["workspace"],
 		"-output=json",
 	}, nil
 }
@@ -4822,7 +4812,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_drift_detect",
-			Description: "Returns assessment results for a workspace showing detected drift and changed resources.",
+			Description: "Returns the latest health assessment for a workspace via the JSON:API current-assessment-result endpoint. Output: { workspace, org, assessments_enabled, assessment_id, drifted, succeeded, last_assessment_at, resources_drifted, resources_undrifted, drifted_addresses[], error_message }. When health assessments are not enabled (HTTP 404) returns { assessments_enabled: false, message }. Read-only.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
