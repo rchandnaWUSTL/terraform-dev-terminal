@@ -2844,6 +2844,11 @@ func complianceSummaryCall(ctx context.Context, args map[string]string, timeoutS
 		}
 		return atRisk[i].Workspace < atRisk[j].Workspace
 	})
+	atRiskNames := make([]string, 0, len(atRisk))
+	for _, r := range atRisk {
+		atRiskNames = append(atRiskNames, r.Workspace)
+	}
+
 	priorityList := make([]priorityEntry, 0, 5)
 	limit := 5
 	if len(atRisk) < limit {
@@ -3004,6 +3009,7 @@ func complianceSummaryCall(ctx context.Context, args map[string]string, timeoutS
 		"critical_workspaces":   criticalWorkspaces,
 		"top_cves":              topCVEs,
 		"remediation_priority":  priorityList,
+		"at_risk_workspace_names": atRiskNames,
 		"cve_data_unavailable":  auditOut.CVEDataUnavailable,
 		"provider_data_partial": providerDataPartial,
 		"provider_audits":       providerAudits,
@@ -6492,7 +6498,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_compliance_summary",
-			Description: "Builds an org-wide compliance posture snapshot for security/audit review readiness. Internally fans out _hcp_tf_version_audit (Terraform CVEs across all workspaces) and, when include_providers=\"true\", a top-3-by-resource-count _hcp_tf_provider_audit fan-out for provider CVEs (default off; ~30s when on). Computes a severity-weighted compliance_score (0-100, null when CVE data is unavailable), top_cves rolled up across the org, remediation_priority list sorted by severity → resources → prod-name signal, and a plain-English compliance_verdict (✓ healthy / ⚠ warning / ✗ degraded / indeterminate). Read-only. Returns { org, generated_at, compliance_score, compliance_verdict, ready_for_review, total_workspaces, compliant_workspaces, at_risk_workspaces, critical_workspaces, top_cves[], remediation_priority[], cve_data_unavailable, provider_data_partial, provider_audits[], include_providers }.",
+			Description: "Builds an org-wide compliance posture snapshot for security/audit review readiness. Internally fans out _hcp_tf_version_audit (Terraform CVEs across all workspaces) and, when include_providers=\"true\", a top-3-by-resource-count _hcp_tf_provider_audit fan-out for provider CVEs (default off; ~30s when on). Computes a severity-weighted compliance_score (0-100, null when CVE data is unavailable), top_cves rolled up across the org, remediation_priority list sorted by severity → resources → prod-name signal, and a plain-English compliance_verdict (✓ healthy / ⚠ warning / ✗ degraded / indeterminate). Read-only. Returns { org, generated_at, compliance_score, compliance_verdict, ready_for_review, total_workspaces, compliant_workspaces, at_risk_workspaces, critical_workspaces, top_cves[], remediation_priority[] (top 5 only — for display), at_risk_workspace_names[] (full list — pass to _hcp_tf_batch_upgrade for 'fix the rest'), cve_data_unavailable, provider_data_partial, provider_audits[], include_providers }.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
