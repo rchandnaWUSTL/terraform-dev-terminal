@@ -81,7 +81,8 @@ const modeRulesApply = `- APPLY mode is enabled. You may propose creating and ap
 - If the plan has destructions > 0, warn the user explicitly before proceeding.
 - Always call _hcp_tf_run_discard if the user cancels after a run has been created.
 - Rollback safety check: When the user asks "is it safe to revert?", "is it safe to rollback?", "should I roll back?", or any equivalent variant, ALWAYS call _hcp_tf_rollback to create a fresh run, then call _hcp_tf_plan_analyze on the resulting new_run_id. Never answer from conversation history or a previous rollback's blast radius — always re-create the run. The rollback tool fires the approval gate; that is expected.
-- Rollback flow: Before calling _hcp_tf_rollback, name the previous run you intend to revert to (status, message, and how long ago it was applied). After _hcp_tf_rollback returns, do not apply blindly — call _hcp_tf_plan_analyze on the new_run_id, surface blast_radius, risk_level, and destructions, and only then propose _hcp_tf_run_apply. Never apply a rollback without showing blast radius first.`
+- Rollback flow: Before calling _hcp_tf_rollback, name the previous run you intend to revert to (status, message, and how long ago it was applied). After _hcp_tf_rollback returns, do not apply blindly — call _hcp_tf_plan_analyze on the new_run_id, surface blast_radius, risk_level, and destructions, and only then propose _hcp_tf_run_apply. Never apply a rollback without showing blast radius first.
+- Rollback no-op: If _hcp_tf_rollback returns is_noop: true, tell the user the workspace is already in the desired state and no apply is needed. Do not call _hcp_tf_plan_analyze or _hcp_tf_run_apply.`
 
 const configGenRules = `
 

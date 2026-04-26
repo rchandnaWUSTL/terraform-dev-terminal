@@ -94,15 +94,27 @@ func rollbackCall(ctx context.Context, args map[string]string, timeoutSec int) *
 		return result
 	}
 
+	// HCP Terraform auto-finalizes plans with 0 changes into planned_and_finished,
+	// which the apply gate cannot transition out of. Briefly poll so we can flag
+	// no-op rollbacks before the agent walks into the apply trap.
+	isNoop := checkRollbackNoop(ctx, newRunID, timeoutSec)
+
 	payload := map[string]any{
-		"workspace":                  workspace,
-		"org":                        org,
-		"rolled_back_to_run_id":      targetRunID,
-		"rolled_back_to_created_at":  targetCreatedAt,
-		"rolled_back_to_human":       humanRelative(parseTimeOrZero(targetCreatedAt)),
-		"new_run_id":                 newRunID,
-		"status":                     "queued",
-		"next_step":                  "Call _hcp_tf_plan_analyze with run_id to assess blast radius, then call _hcp_tf_run_apply to complete the rollback after user confirms.",
+		"workspace":                 workspace,
+		"org":                       org,
+		"rolled_back_to_run_id":     targetRunID,
+		"rolled_back_to_created_at": targetCreatedAt,
+		"rolled_back_to_human":      humanRelative(parseTimeOrZero(targetCreatedAt)),
+		"new_run_id":                newRunID,
+	}
+	if isNoop {
+		payload["is_noop"] = true
+		payload["status"] = "planned_and_finished"
+		payload["message"] = "Rollback is a no-op — the workspace is already in the desired state. No apply needed."
+	} else {
+		payload["is_noop"] = false
+		payload["status"] = "queued"
+		payload["next_step"] = "Call _hcp_tf_plan_analyze with run_id to assess blast radius, then call _hcp_tf_run_apply to complete the rollback after user confirms."
 	}
 	out, mErr := json.Marshal(payload)
 	if mErr != nil {
@@ -298,4 +310,35 @@ func parseTimeOrZero(s string) time.Time {
 		return time.Time{}
 	}
 	return t
+}
+
+// checkRollbackNoop polls a freshly-created rollback run for ~5 seconds,
+// returning true when HCP Terraform reports planned_and_finished — the status
+// HCP assigns when a plan completes with zero changes. We poll briefly because
+// no-op plans finalize almost immediately; real plans stay in pending/planning
+// long past this window and fall through to the standard plan_analyze flow.
+func checkRollbackNoop(ctx context.Context, runID string, timeoutSec int) bool {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		showRaw, serr := fetchHCPTFJSON(ctx, timeoutSec, "run", "show", "-id="+runID, "-output=json")
+		if serr != nil {
+			return false
+		}
+		var show map[string]any
+		_ = json.Unmarshal(showRaw, &show)
+		status := firstStringField(show, "Status", "status")
+		switch status {
+		case "planned_and_finished":
+			return true
+		case "errored", "canceled", "discarded":
+			return false
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return false
 }
