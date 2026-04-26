@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -177,7 +179,27 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 }
 
 func (r *REPL) ask(userMsg string) {
-	ctx := context.Background()
+	// Cancellable context lets a SIGINT during a tool call or model stream
+	// short-circuit the in-flight request without killing the process. The
+	// signal handler is only active for the duration of this call so that
+	// Ctrl+C at the prompt still falls through to readline (which exits the
+	// REPL on interrupt).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
+	var cancelled atomic.Bool
+	go func() {
+		select {
+		case <-sigCh:
+			cancelled.Store(true)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	var sawToolResult atomic.Bool
 	var spin *toolSpinner
@@ -187,6 +209,17 @@ func (r *REPL) ask(userMsg string) {
 			r.activeSpin = spin
 		},
 		func(name string, result *tools.CallResult) {
+			// Suppress the inevitable context-canceled tool result that
+			// surfaces when Ctrl+C aborted this very tool — the user gets a
+			// single "Cancelled." message instead of a noisy failure line.
+			if cancelled.Load() {
+				if spin != nil {
+					spin.pause()
+					spin = nil
+				}
+				r.activeSpin = nil
+				return
+			}
 			if spin != nil {
 				spin.finish(name, result)
 				spin = nil
@@ -225,6 +258,13 @@ func (r *REPL) ask(userMsg string) {
 				flushLine(buf.String())
 				buf.Reset()
 			}
+			if cancelled.Load() {
+				for range ch {
+				}
+				fmt.Println()
+				boundaryPink.Println("  ✗ Cancelled.")
+				return
+			}
 			boundaryPink.Printf("Error: %v\n", chunk.Err)
 			return
 		}
@@ -248,6 +288,11 @@ func (r *REPL) ask(userMsg string) {
 		flushLine(buf.String())
 	}
 	fmt.Println()
+
+	if cancelled.Load() {
+		boundaryPink.Println("  ✗ Cancelled.")
+		return
+	}
 
 	r.handleGeneratedConfig(ctx, full.String())
 }
@@ -2149,6 +2194,7 @@ func printBanner(cfg *config.Config) {
 		mode = "apply"
 	}
 	dimWhite.Printf("  model: %s  |  mode: %s  |  type /help for commands\n", cfg.Model, mode)
+	dimWhite.Println("  Press Ctrl+C to cancel a running operation")
 	fmt.Println()
 }
 
@@ -2170,6 +2216,9 @@ func printHelp() {
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")
+	fmt.Println()
+	bold.Println("Keys:")
+	fmt.Println("  Ctrl+C             Cancel a running operation; exits the REPL when at an empty prompt")
 	fmt.Println()
 	bold.Println("Examples:")
 	fmt.Println("  Is it safe to apply my latest prod changes to staging?")
