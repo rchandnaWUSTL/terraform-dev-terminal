@@ -1936,6 +1936,24 @@ func describeAction(name string, args map[string]string) string {
 			return fmt.Sprintf("upgrade workspace %s", ws)
 		}
 		return "upgrade Terraform version"
+	case "_hcp_tf_batch_upgrade":
+		count := 0
+		if raw := args["workspaces"]; raw != "" {
+			for _, name := range strings.Split(raw, ",") {
+				if strings.TrimSpace(name) != "" {
+					count++
+				}
+			}
+		}
+		ver := args["target_version"]
+		switch {
+		case count > 0 && ver != "":
+			return fmt.Sprintf("queue a batch upgrade for %d workspaces to Terraform %s", count, ver)
+		case count > 0:
+			return fmt.Sprintf("queue a batch upgrade for %d workspaces", count)
+		default:
+			return "queue a batch upgrade"
+		}
 	case "_hcp_tf_rollback":
 		if ws := args["workspace"]; ws != "" {
 			return fmt.Sprintf("revert workspace %s to the previous run", ws)
