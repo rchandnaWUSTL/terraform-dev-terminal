@@ -2949,7 +2949,11 @@ func complianceSummaryCall(ctx context.Context, args map[string]string, timeoutS
 		verdict = "✓ No action needed — infrastructure is in good shape for review."
 		readyForReview = true
 	case *compliancePtr >= 70:
-		verdict = fmt.Sprintf("⚠ Action required before review — %d critical workspace%s need attention.", criticalWorkspaces, plural(criticalWorkspaces))
+		if criticalWorkspaces > 0 {
+			verdict = fmt.Sprintf("⚠ Action required before review — %d critical workspace%s need attention.", criticalWorkspaces, plural(criticalWorkspaces))
+		} else {
+			verdict = fmt.Sprintf("⚠ Action required before review — %d workspace%s have known vulnerabilities.", atRiskWorkspaces, plural(atRiskWorkspaces))
+		}
 	default:
 		verdict = fmt.Sprintf("✗ Significant vulnerabilities detected — remediation required before the review. %d of %d workspaces have known vulnerabilities.", atRiskWorkspaces, totalWorkspaces)
 	}
