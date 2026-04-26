@@ -17,16 +17,14 @@ import (
 
 // upgradePreviewCall implements _hcp_tf_upgrade_preview. It rewrites the
 // requested provider's version constraint in a copy of the local HCL,
-// uploads the result as a speculative configuration version, polls for the
-// auto-queued plan-only run, feeds it through planAnalyzeCall for risk +
+// uploads the result as a speculative configuration version, creates an explicit
+// plan-only run against it, feeds it through planAnalyzeCall for risk +
 // blast radius, cross-references upgrading_fixes from providerAuditCall for
 // the CVE delta, and pulls breaking changes out of GitHub release notes.
 // The speculative run is discarded after analysis (best-effort).
 //
-// Speculative configversions auto-queue a plan-only run when -auto-queue-runs
-// is true (the hcptf default). hcptf run create does not accept a
-// -configuration-version flag, so the auto-queue mechanism is the only path
-// to a speculative run wired to a specific configversion.
+// We explicitly create a run after uploading the config version rather than
+// relying on auto-queue, since workspaces may have auto-queue-runs disabled.
 func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
 	start := time.Now()
 	result := &CallResult{ToolName: "_hcp_tf_upgrade_preview", Args: args}
@@ -146,11 +144,27 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 		return result
 	}
 
-	// Step 4: poll for the auto-queued speculative run on this configversion,
+	// Step 4: explicitly create a run against the speculative configversion,
 	// then wait for it to reach a terminal plan state.
-	runID, prErr := waitForSpeculativeRun(ctx, org, workspace, cvID, timeoutSec)
-	if prErr != nil {
-		result.Err = prErr
+	runRaw, runCreateErr := fetchHCPTFJSON(ctx, timeoutSec, "run", "create",
+		"-org="+org, "-workspace="+workspace, "-configuration-version="+cvID,
+		"-message=tfpilot: upgrade preview", "-output=json")
+	if runCreateErr != nil {
+		result.Err = runCreateErr
+		result.Duration = time.Since(start)
+		return result
+	}
+	runID := firstStringField(decodeRunCreate(runRaw), "ID", "id")
+	if runID == "" {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "run create did not return a run ID"}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	// Wait for the run to reach a terminal plan state.
+	planErr := waitForRunPlanned(ctx, runID, timeoutSec)
+	if planErr != nil {
+		result.Err = planErr
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -362,6 +376,50 @@ func decodeConfigVersionCreate(raw []byte) (string, string) {
 		}
 	}
 	return id, url
+}
+
+// decodeRunCreate pulls the run ID out of the JSON returned by `hcptf run create`.
+// Tolerates field-name variants for consistency.
+func decodeRunCreate(raw []byte) map[string]any {
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return map[string]any{}
+	}
+	return parsed
+}
+
+// waitForRunPlanned polls a known run ID until it reaches a terminal plan state.
+// Returns nil once the run is planned. Times out after 5 minutes.
+func waitForRunPlanned(ctx context.Context, runID string, timeoutSec int) *ToolError {
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return &ToolError{ErrorCode: "execution_error", Message: "context canceled while waiting for plan to finish"}
+		default:
+		}
+		showRaw, serr := fetchHCPTFJSON(ctx, timeoutSec, "run", "show", "-id="+runID, "-output=json")
+		if serr != nil {
+			return serr
+		}
+		var show map[string]any
+		_ = json.Unmarshal(showRaw, &show)
+		status := firstStringField(show, "Status", "status")
+		switch status {
+		case "planned", "planned_and_finished", "cost_estimated", "policy_checked":
+			return nil
+		case "errored", "canceled", "discarded":
+			return &ToolError{
+				ErrorCode: "execution_error",
+				Message:   fmt.Sprintf("run %s ended with status %q before producing a plan", runID, status),
+			}
+		}
+		time.Sleep(4 * time.Second)
+	}
+	return &ToolError{
+		ErrorCode: "execution_error",
+		Message:   fmt.Sprintf("run %s did not reach a planned state within 5 minutes", runID),
+	}
 }
 
 // waitForSpeculativeRun polls hcptf run list for a run whose ConfigurationVersionID
