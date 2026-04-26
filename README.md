@@ -65,6 +65,7 @@ export ANTHROPIC_API_KEY=your-key
 - Config generation — describe intent, get valid HCL written to disk
 - Workspace creation and resource provisioning from natural language — describe the workspace and resources, and tfpilot creates, uploads, and queues a run in one step
 - Org-wide Terraform version audit with CVE checking — groups workspaces by version, flags known vulnerabilities (sourced from OSV.dev), scores upgrade complexity
+- Per-workspace module audit — infers Terraform Registry modules from a workspace's resource addresses and surfaces the latest available versions from the public registry
 
 ---
 

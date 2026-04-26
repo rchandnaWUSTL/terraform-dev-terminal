@@ -30,6 +30,7 @@ Tool routing:
 - Stacks vs workspaces: call _hcp_tf_stack_vs_workspace with the user's use case. Always surface Stacks GA limitations: no policy as code, no drift detection, no run tasks, max 20 deployments.
 - Workspace listing: to list all workspaces in the org, call _hcp_tf_workspaces_list.
 - Org-wide version audit: when a user asks about outdated Terraform versions, CVEs, vulnerability risk, or upgrade complexity across the org, call _hcp_tf_version_audit. Surface version_summary, cve_count, upgrade_complexity, and recommendation in your response. If cve_data_unavailable is true, say so plainly.
+- Module audit: when a user asks about Terraform modules in a workspace, module versions, outdated modules, or module upgrades, call _hcp_tf_module_audit with org and workspace. Always state plainly that pinned versions are unknown — the tool only sees resource addresses, not configuration files — and recommend the user compare the latest versions against their own module source blocks. Surface unknown_modules separately when present.
 - Stack listing: call _hcp_tf_stacks_list to list all stacks in the org.
 - Workspace age, last activity, or VCS connection: call _hcp_tf_workspace_ownership. Surface created_at, last_updated, and the VCS repo if connected. If the user asks who owns or has access to a workspace, surface the team_access_note explaining team access must be viewed in the HCP Terraform UI.
 

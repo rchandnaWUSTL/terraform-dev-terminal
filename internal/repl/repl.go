@@ -159,6 +159,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleStacks()
 	case "/audit":
 		r.handleAudit()
+	case "/modules":
+		r.handleModules()
 	case "/workspaces":
 		r.handleWorkspaces(parts[1:])
 	default:
@@ -776,6 +778,89 @@ func (r *REPL) handleAudit() {
 	} else {
 		waypointTeal.Printf("  %s\n", payload.Recommendation)
 	}
+}
+
+// handleModules implements /modules by calling _hcp_tf_module_audit for the
+// pinned org+workspace. Modules detected in the workspace's resource addresses
+// are listed alongside the latest registry version; pinned versions are
+// labelled unknown because the tool only sees state, not configuration.
+func (r *REPL) handleModules() {
+	if r.org == "" {
+		boundaryPink.Println("Set an org first with /org <name>")
+		return
+	}
+	if r.workspace == "" {
+		boundaryPink.Println("Set a workspace first with /workspace <name>")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_module_audit",
+		map[string]string{"org": r.org, "workspace": r.workspace},
+		r.cfg.TimeoutSeconds,
+	)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_module_audit: %s\n", result.Err.Message)
+		return
+	}
+
+	type moduleRow struct {
+		InferredName  string `json:"inferred_name"`
+		RegistryPath  string `json:"registry_path"`
+		LatestVersion string `json:"latest_version"`
+		Description   string `json:"description"`
+		DocsURL       string `json:"docs_url"`
+		PinnedVersion string `json:"pinned_version"`
+		Status        string `json:"status"`
+	}
+	var payload struct {
+		Workspace       string      `json:"workspace"`
+		Org             string      `json:"org"`
+		ModulesDetected int         `json:"modules_detected"`
+		Modules         []moduleRow `json:"modules"`
+		UnknownModules  []string    `json:"unknown_modules"`
+		Note            string      `json:"note"`
+	}
+	if err := json.Unmarshal(result.Output, &payload); err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_module_audit: could not parse output: %v\n", err)
+		return
+	}
+
+	bold.Printf("  Module Audit — %s\n", payload.Workspace)
+	fmt.Println()
+	dimWhite.Printf("  %d modules detected from resource addresses.\n", payload.ModulesDetected)
+	fmt.Println()
+
+	for _, m := range payload.Modules {
+		tfPurple.Printf("  • %s", m.RegistryPath)
+		if m.LatestVersion == "unavailable" {
+			boundaryPink.Printf("    latest: unavailable\n")
+		} else {
+			waypointTeal.Printf("    latest: %s\n", m.LatestVersion)
+		}
+		if m.Description != "" {
+			fmt.Printf("    %s\n", m.Description)
+		}
+		if m.DocsURL != "" {
+			dimWhite.Printf("    Docs: %s\n", m.DocsURL)
+		}
+		fmt.Println()
+	}
+
+	if len(payload.UnknownModules) > 0 {
+		vaultYellow.Println("  Unknown modules (not in registry map):")
+		for _, u := range payload.UnknownModules {
+			fmt.Printf("    • %s\n", u)
+		}
+		fmt.Println()
+	}
+
+	dimWhite.Printf("  Note: %s\n", payload.Note)
+	fmt.Println()
 }
 
 func stringField(m map[string]any, keys ...string) string {
@@ -1501,6 +1586,7 @@ func printHelp() {
 	fmt.Println("  /workspaces [filter]   List workspaces in the pinned org (optional name filter)")
 	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
 	fmt.Println("  /audit             Terraform version + CVE audit across all workspaces")
+	fmt.Println("  /modules           Per-workspace module version report from the Terraform Registry")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")

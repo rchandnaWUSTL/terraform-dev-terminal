@@ -1489,6 +1489,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_version_audit" {
 		return versionAuditCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_module_audit" {
+		return moduleAuditCall(ctx, args, timeoutSec)
+	}
 	if name == "_hcp_tf_stacks_list" {
 		return stacksListCall(ctx, args, timeoutSec)
 	}
@@ -2924,6 +2927,248 @@ func versionAuditCall(ctx context.Context, args map[string]string, timeoutSec in
 	return result
 }
 
+// moduleAuditNote is appended to every _hcp_tf_module_audit response so the
+// caller is reminded that pinned versions cannot be inferred from resource
+// addresses alone.
+const moduleAuditNote = "Module versions are inferred from resource addresses. Pinned versions are not available without access to the Terraform configuration files. Compare the latest versions above against your module source blocks."
+
+// moduleRegistryLookup maps the local module instance name observed in a
+// workspace's resource addresses to the canonical Terraform Registry path.
+// The set is intentionally small: it covers the well-known terraform-aws-modules
+// names we expect to see in the test orgs. Names absent from this map fall into
+// unknown_modules and are surfaced for the user to inspect by hand.
+var moduleRegistryLookup = map[string]string{
+	"vpc":                  "terraform-aws-modules/vpc/aws",
+	"app_security_group":   "terraform-aws-modules/security-group/aws",
+	"lb_security_group":    "terraform-aws-modules/security-group/aws",
+	"elb_http":             "terraform-aws-modules/elb/aws",
+	"elb":                  "terraform-aws-modules/elb/aws",
+	"alb":                  "terraform-aws-modules/alb/aws",
+	"eks":                  "terraform-aws-modules/eks/aws",
+	"rds":                  "terraform-aws-modules/rds/aws",
+	"s3_bucket":            "terraform-aws-modules/s3-bucket/aws",
+	"iam_role":             "terraform-aws-modules/iam/aws",
+	"iam_policy":           "terraform-aws-modules/iam/aws",
+	"autoscaling":          "terraform-aws-modules/autoscaling/aws",
+	"lambda_function":      "terraform-aws-modules/lambda/aws",
+	"route53_records":      "terraform-aws-modules/route53/aws",
+	"acm":                  "terraform-aws-modules/acm/aws",
+	"kms":                  "terraform-aws-modules/kms/aws",
+	"cloudwatch_log_group": "terraform-aws-modules/cloudwatch/aws",
+	"transit_gateway":      "terraform-aws-modules/transit-gateway/aws",
+	"managed_node_group":   "terraform-aws-modules/eks/aws",
+	"fargate_profile":      "terraform-aws-modules/eks/aws",
+}
+
+// extractModuleInstanceNames returns the distinct top-level module instance
+// names observed across the resource list. hcptf surfaces the Module field as a
+// dot-separated path (e.g. "vpc", "lb_security_group.sg") with "root" used for
+// resources that live outside any module — we take the leading segment, drop
+// "root", and dedupe.
+func extractModuleInstanceNames(items []workspaceResource) []string {
+	skip := map[string]bool{"": true, "root": true, "data": true, "local": true, "var": true, "output": true}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		path := strings.TrimSpace(it.Module)
+		if path == "" {
+			// Fall back to the Address — the first dot-separated token is the
+			// module instance name when the resource lives inside a module.
+			if it.Address == "" {
+				continue
+			}
+			path = it.Address
+		}
+		first := path
+		if idx := strings.Index(path, "."); idx >= 0 {
+			first = path[:idx]
+		}
+		if skip[first] {
+			continue
+		}
+		if _, ok := seen[first]; ok {
+			continue
+		}
+		seen[first] = struct{}{}
+		out = append(out, first)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// registryModule mirrors the JSON shape of `hcptf publicregistry module`.
+type registryModule struct {
+	Name        string `json:"Name"`
+	Version     string `json:"Version"`
+	Description string `json:"Description"`
+	DocsURL     string `json:"DocsURL"`
+	Source      string `json:"Source"`
+}
+
+// fetchRegistryModule shells out to `hcptf publicregistry module` for a single
+// registry path and returns the parsed metadata or a sentinel "unavailable"
+// flag when the registry call fails (HTML guard, exec error, or parse error).
+// Failures never abort the whole audit — they degrade per-module.
+func fetchRegistryModule(ctx context.Context, registryPath string, timeoutSec int) (*registryModule, bool) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "hcptf", "publicregistry", "module",
+		"-name="+registryPath,
+		"-output=json",
+	)
+	out, execErr := cmd.Output()
+	if execErr != nil {
+		return nil, true
+	}
+	if looksLikeHTML(string(out)) {
+		return nil, true
+	}
+	var mod registryModule
+	if err := json.Unmarshal(out, &mod); err != nil {
+		return nil, true
+	}
+	if mod.Version == "" {
+		return nil, true
+	}
+	return &mod, false
+}
+
+// moduleAuditCall infers Terraform Registry modules used by a workspace from
+// its resource addresses and surfaces the latest available version for each
+// known module via `hcptf publicregistry module`. Pinned versions are not
+// available without the underlying .tf files, so every entry is labeled
+// "check_recommended" and the response carries a note explaining the limit.
+// Read-only.
+func moduleAuditCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_module_audit", Args: args}
+
+	if err := require(args, "org", "workspace"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	workspace := args["workspace"]
+
+	raw, fetchErr := fetchWorkspaceResources(ctx, org, workspace, timeoutSec)
+	if fetchErr != nil {
+		result.Err = fetchErr
+		result.Duration = time.Since(start)
+		return result
+	}
+	items, perr := unmarshalResources(raw)
+	if perr != nil {
+		result.Err = &ToolError{ErrorCode: "parse_error", Message: perr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	names := extractModuleInstanceNames(items)
+
+	type knownModule struct {
+		inferredName string
+		registryPath string
+	}
+	var known []knownModule
+	var unknown []string
+	pathToInstances := map[string][]string{}
+	for _, n := range names {
+		if path, ok := moduleRegistryLookup[n]; ok {
+			known = append(known, knownModule{inferredName: n, registryPath: path})
+			pathToInstances[path] = append(pathToInstances[path], n)
+		} else {
+			unknown = append(unknown, n)
+		}
+	}
+
+	uniquePaths := make([]string, 0, len(pathToInstances))
+	for p := range pathToInstances {
+		uniquePaths = append(uniquePaths, p)
+	}
+	sort.Strings(uniquePaths)
+
+	type fetched struct {
+		path string
+		mod  *registryModule
+		bad  bool
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	results := make([]fetched, 0, len(uniquePaths))
+	for _, p := range uniquePaths {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			mod, bad := fetchRegistryModule(ctx, path, timeoutSec)
+			mu.Lock()
+			results = append(results, fetched{path: path, mod: mod, bad: bad})
+			mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+
+	pathToFetched := make(map[string]fetched, len(results))
+	for _, r := range results {
+		pathToFetched[r.path] = r
+	}
+
+	type moduleEntry struct {
+		InferredName  string `json:"inferred_name"`
+		RegistryPath  string `json:"registry_path"`
+		LatestVersion string `json:"latest_version"`
+		Description   string `json:"description"`
+		DocsURL       string `json:"docs_url"`
+		PinnedVersion string `json:"pinned_version"`
+		Status        string `json:"status"`
+	}
+	entries := make([]moduleEntry, 0, len(known))
+	for _, k := range known {
+		f, ok := pathToFetched[k.registryPath]
+		entry := moduleEntry{
+			InferredName:  k.inferredName,
+			RegistryPath:  k.registryPath,
+			PinnedVersion: "unknown",
+			Status:        "check_recommended",
+		}
+		if !ok || f.bad || f.mod == nil {
+			entry.LatestVersion = "unavailable"
+		} else {
+			entry.LatestVersion = f.mod.Version
+			entry.Description = f.mod.Description
+			entry.DocsURL = f.mod.DocsURL
+		}
+		entries = append(entries, entry)
+	}
+
+	if unknown == nil {
+		unknown = []string{}
+	}
+
+	payload := map[string]any{
+		"workspace":        workspace,
+		"org":              org,
+		"modules_detected": len(names),
+		"modules":          entries,
+		"unknown_modules":  unknown,
+		"note":             moduleAuditNote,
+	}
+
+	body, mErr := json.Marshal(payload)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(body)
+	result.Duration = time.Since(start)
+	return result
+}
+
 // normalizeTerraformVersion strips constraint prefixes and the leading "v" so
 // values like "~>1.14.0", ">= 1.5.0", or "v1.5.0" become "1.14.0" / "1.5.0".
 // hcptf surfaces both pinned versions and Terraform CLI constraint operators
@@ -3763,6 +4008,18 @@ func Definitions() []ToolDef {
 					"min_version": map[string]any{"type": "string", "description": "Optional baseline (defaults to 1.5.0)"},
 				},
 				"required": []string{"org"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_module_audit",
+			Description: "Infers which Terraform Registry modules a workspace uses by examining its resource addresses, then queries the public registry (`hcptf publicregistry module`) for the latest available version of each known module. Pinned versions are not available without access to the workspace's .tf files, so every entry is labeled `pinned_version: unknown` and `status: check_recommended`. Module names not present in the built-in registry map are surfaced separately under `unknown_modules`. Read-only; degrades to `latest_version: unavailable` when an individual registry call fails.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
+				},
+				"required": []string{"org", "workspace"},
 			},
 		},
 		{

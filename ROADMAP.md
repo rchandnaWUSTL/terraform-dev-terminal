@@ -140,8 +140,11 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 ## v1.5 — Org Health Audit (In Progress)
 - _hcp_tf_version_audit tool: groups all workspaces by Terraform version, surfaces CVEs from OSV.dev, and scores upgrade complexity per version group
 - /audit slash command: human-readable version + CVE summary for the pinned org
-- Graceful degradation: tool still returns version groupings if OSV.dev is unreachable
-- Module version checking and full upgrade-effort scoring deferred to v1.5.1
+- _hcp_tf_module_audit tool: infers Terraform Registry modules from a workspace's resource addresses and queries `hcptf publicregistry` for the latest available version of each known module; modules outside the built-in registry map are surfaced under unknown_modules
+- /modules slash command: per-workspace module version report
+- Known limitation: pinned module versions are not available without access to the workspace's .tf files — the tool surfaces only the latest registry version and labels every entry `check_recommended`
+- Graceful degradation: version audit still returns groupings if OSV.dev is unreachable; module audit degrades to `latest_version: unavailable` per module on registry failures
+- Full upgrade-effort scoring deferred to v1.5.1
 
 ## v1.6 — Plan Analyzer v2
 - `how_to_reduce_risk` field per risk factor: concrete, actionable suggestions for making a High or Critical plan safer before applying
