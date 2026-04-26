@@ -2221,7 +2221,14 @@ func resourceTypesFromRaw(raw []byte) ([]string, error) {
 }
 
 func unmarshalResources(raw []byte) ([]workspaceResource, error) {
-	if len(strings.TrimSpace(string(raw))) == 0 {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil, nil
+	}
+	// hcptf occasionally prints a plain-text "No resources found" line for empty
+	// workspaces instead of an empty JSON array. Treat any non-JSON payload as
+	// an empty resource list rather than surfacing a parse error.
+	if first := trimmed[0]; first != '[' && first != '{' {
 		return nil, nil
 	}
 	var items []workspaceResource
@@ -2986,6 +2993,11 @@ func extractModuleInstanceNames(items []workspaceResource) []string {
 		if idx := strings.Index(path, "."); idx >= 0 {
 			first = path[:idx]
 		}
+		// Strip count/for_each suffixes ("ec2_instances[0]", `cluster["us-east-1"]`)
+		// so module entries dedupe across instances of the same source.
+		if idx := strings.Index(first, "["); idx > 0 {
+			first = first[:idx]
+		}
 		if skip[first] {
 			continue
 		}
@@ -3070,16 +3082,10 @@ func moduleAuditCall(ctx context.Context, args map[string]string, timeoutSec int
 
 	names := extractModuleInstanceNames(items)
 
-	type knownModule struct {
-		inferredName string
-		registryPath string
-	}
-	var known []knownModule
 	var unknown []string
 	pathToInstances := map[string][]string{}
 	for _, n := range names {
 		if path, ok := moduleRegistryLookup[n]; ok {
-			known = append(known, knownModule{inferredName: n, registryPath: path})
 			pathToInstances[path] = append(pathToInstances[path], n)
 		} else {
 			unknown = append(unknown, n)
@@ -3121,20 +3127,22 @@ func moduleAuditCall(ctx context.Context, args map[string]string, timeoutSec int
 	}
 
 	type moduleEntry struct {
-		InferredName  string `json:"inferred_name"`
-		RegistryPath  string `json:"registry_path"`
-		LatestVersion string `json:"latest_version"`
-		Description   string `json:"description"`
-		DocsURL       string `json:"docs_url"`
-		PinnedVersion string `json:"pinned_version"`
-		Status        string `json:"status"`
+		InferredNames []string `json:"inferred_names"`
+		RegistryPath  string   `json:"registry_path"`
+		LatestVersion string   `json:"latest_version"`
+		Description   string   `json:"description"`
+		DocsURL       string   `json:"docs_url"`
+		PinnedVersion string   `json:"pinned_version"`
+		Status        string   `json:"status"`
 	}
-	entries := make([]moduleEntry, 0, len(known))
-	for _, k := range known {
-		f, ok := pathToFetched[k.registryPath]
+	entries := make([]moduleEntry, 0, len(uniquePaths))
+	for _, p := range uniquePaths {
+		instances := append([]string(nil), pathToInstances[p]...)
+		sort.Strings(instances)
+		f, ok := pathToFetched[p]
 		entry := moduleEntry{
-			InferredName:  k.inferredName,
-			RegistryPath:  k.registryPath,
+			InferredNames: instances,
+			RegistryPath:  p,
 			PinnedVersion: "unknown",
 			Status:        "check_recommended",
 		}
