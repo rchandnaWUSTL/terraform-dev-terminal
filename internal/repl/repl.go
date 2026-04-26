@@ -1944,7 +1944,7 @@ func printBanner(cfg *config.Config) {
 	}
 	fmt.Println()
 	white.Println("  AI-powered development for infrastructure-as-code")
-	dimWhite.Println("  v0.1.0 • Type /help for commands")
+	dimWhite.Println("  v1.7.0 • Type /help for commands")
 	fmt.Println()
 
 	sepWidth := utf8.RuneCountInString(tfRows[0])
