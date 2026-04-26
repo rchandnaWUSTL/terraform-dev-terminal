@@ -64,12 +64,14 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 	}
 
 	// Step 1: provider audit for current version + CVE delta context.
+	fmt.Fprintf(os.Stderr, "  📦 Auditing current provider versions...\n")
 	auditRes := providerAuditCall(ctx, map[string]string{"org": org, "workspace": workspace}, timeoutSec)
 	if auditRes.Err != nil {
 		result.Err = auditRes.Err
 		result.Duration = time.Since(start)
 		return result
 	}
+	fmt.Fprintf(os.Stderr, "  ✓ Audit complete\n")
 
 	// Extract available providers for a better error message
 	availableProviders := extractProviderNames(auditRes.Output)
@@ -86,6 +88,7 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 	}
 
 	// Step 2: stage HCL into a tempdir and rewrite the version constraint.
+	fmt.Fprintf(os.Stderr, "  📝 Staging HCL and rewriting version constraint...\n")
 	stageDir, terr := os.MkdirTemp("", "tfpilot-upgrade-*")
 	if terr != nil {
 		result.Err = &ToolError{ErrorCode: "execution_error", Message: "tempdir: " + terr.Error()}
@@ -112,8 +115,10 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 		result.Duration = time.Since(start)
 		return result
 	}
+	fmt.Fprintf(os.Stderr, "  ✓ HCL ready (%d file(s) updated)\n", mutated)
 
 	// Step 3: create speculative configversion + upload.
+	fmt.Fprintf(os.Stderr, "  📤 Uploading speculative configuration...\n")
 	cvRaw, cvErr := fetchHCPTFJSON(ctx, timeoutSec, "configversion", "create",
 		"-org="+org, "-workspace="+workspace, "-speculative", "-output=json")
 	if cvErr != nil {
@@ -143,6 +148,7 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 		result.Duration = time.Since(start)
 		return result
 	}
+	fmt.Fprintf(os.Stderr, "  ✓ Configuration uploaded\n")
 
 	// Step 4: explicitly create a run against the speculative configversion,
 	// then wait for it to reach a terminal plan state.
@@ -170,6 +176,7 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 	}
 
 	// Step 5: analyze the speculative plan.
+	fmt.Fprintf(os.Stderr, "  🔍 Analyzing plan: risk assessment and blast radius...\n")
 	analyzeRes := planAnalyzeCall(ctx, map[string]string{"org": org, "workspace": workspace, "run_id": runID}, timeoutSec)
 	// Discard regardless of analyze outcome — speculative runs cannot apply but
 	// discarding is harmless and matches the explicit cleanup contract.
@@ -188,9 +195,12 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 		result.Duration = time.Since(start)
 		return result
 	}
+	fmt.Fprintf(os.Stderr, "  ✓ Plan analyzed\n")
 
 	// Step 6: GitHub release notes for breaking changes.
+	fmt.Fprintf(os.Stderr, "  📋 Fetching breaking changes from GitHub...\n")
 	breakingChanges, breakingSource := fetchProviderReleaseNotes(ctx, provider, pinnedVersion, targetVersion)
+	fmt.Fprintf(os.Stderr, "  ✓ Release notes fetched\n")
 
 	// Step 7: filter CVEs that the upgrade actually closes (fixed_in <= target).
 	cvesFixed := filterCVEsFixedBy(upgradingFixes, targetVersion)
@@ -392,12 +402,26 @@ func decodeRunCreate(raw []byte) map[string]any {
 // Returns nil once the run is planned. Times out after 5 minutes.
 func waitForRunPlanned(ctx context.Context, runID string, timeoutSec int) *ToolError {
 	deadline := time.Now().Add(5 * time.Minute)
+	start := time.Now()
+	lastProgress := time.Now()
+	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	spinIdx := 0
+
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return &ToolError{ErrorCode: "execution_error", Message: "context canceled while waiting for plan to finish"}
 		default:
 		}
+
+		// Print progress every ~10 seconds to stderr.
+		if time.Since(lastProgress) >= 10*time.Second {
+			elapsed := time.Since(start)
+			fmt.Fprintf(os.Stderr, "  %s Waiting for speculative plan... (%ds)\n", spinner[spinIdx%len(spinner)], int(elapsed.Seconds()))
+			spinIdx++
+			lastProgress = time.Now()
+		}
+
 		showRaw, serr := fetchHCPTFJSON(ctx, timeoutSec, "run", "show", "-id="+runID, "-output=json")
 		if serr != nil {
 			return serr
@@ -407,6 +431,7 @@ func waitForRunPlanned(ctx context.Context, runID string, timeoutSec int) *ToolE
 		status := firstStringField(show, "Status", "status")
 		switch status {
 		case "planned", "planned_and_finished", "cost_estimated", "policy_checked":
+			fmt.Fprintf(os.Stderr, "  ✓ Plan complete — analyzing...\n")
 			return nil
 		case "errored", "canceled", "discarded":
 			return &ToolError{

@@ -449,9 +449,10 @@ func runDiagnoseCall(ctx context.Context, args map[string]string, timeoutSec int
 	chRun := make(chan fetchResult, 1)
 	chPlanLogs := make(chan fetchResult, 1)
 	chApplyLogs := make(chan fetchResult, 1)
+	chPolicy := make(chan fetchResult, 1)
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "run", "show", "-id="+runID, "-output=json")
@@ -467,10 +468,16 @@ func runDiagnoseCall(ctx context.Context, args map[string]string, timeoutSec int
 		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "apply", "logs", "-run-id="+runID, "-output=json")
 		chApplyLogs <- fetchResult{raw: raw, err: ferr}
 	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "policycheck", "list", "-run-id="+runID, "-output=json")
+		chPolicy <- fetchResult{raw: raw, err: ferr}
+	}()
 	wg.Wait()
 	rRun := <-chRun
 	rPlanLogs := <-chPlanLogs
 	rApplyLogs := <-chApplyLogs
+	rPolicy := <-chPolicy
 
 	if rRun.err != nil {
 		result.Err = rRun.err
@@ -493,6 +500,12 @@ func runDiagnoseCall(ctx context.Context, args map[string]string, timeoutSec int
 		"affected_resources": diag.resources,
 		"log_snippet":        diag.snippet,
 		"suggested_fix":      diag.fix,
+	}
+
+	if diag.category == "policy" && rPolicy.err == nil {
+		if interpreted := interpretFailedPolicies(rPolicy.raw); len(interpreted) > 0 {
+			payload["failed_policies"] = interpreted
+		}
 	}
 
 	out, mErr := json.Marshal(payload)
@@ -1005,6 +1018,107 @@ func decodePolicyChecks(raw []byte, ferr *ToolError) (policyCheckSummary, bool) 
 		return policyCheckSummary{}, false
 	}
 	return sum, true
+}
+
+// failedPolicy is a decoded entry for a single failed policy in a policycheck
+// list payload. enforcementLevel is empty when the field is absent.
+type failedPolicy struct {
+	name             string
+	enforcementLevel string
+}
+
+// decodeFailedPolicies extracts only the failed policy entries from a `hcptf
+// policycheck list -output=json` payload, preserving each policy's name and
+// enforcement level. Returns nil when no failures are present so the diagnose
+// flow can omit the field cleanly.
+func decodeFailedPolicies(raw []byte) []failedPolicy {
+	if len(raw) == 0 {
+		return nil
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return nil
+	}
+	var out []failedPolicy
+	for _, item := range arr {
+		status := strings.ToLower(firstStringField(item, "status", "Status", "result", "Result"))
+		switch status {
+		case "failed", "fail", "hard_failed", "errored":
+		default:
+			continue
+		}
+		name := firstStringField(item, "name", "Name", "policy", "Policy", "policy_name", "PolicyName")
+		if name == "" {
+			name = firstStringField(item, "id", "ID")
+		}
+		if name == "" {
+			continue
+		}
+		level := firstStringField(item,
+			"enforcement_level", "EnforcementLevel", "enforcement-level",
+			"enforce", "Enforce", "enforcement", "Enforcement",
+		)
+		out = append(out, failedPolicy{name: name, enforcementLevel: level})
+	}
+	return out
+}
+
+// policyNamePattern maps lowercased substrings found in a Sentinel/OPA policy
+// name to a human-readable requirement. The first matching entry wins; order
+// is from most-specific to least-specific.
+type policyNamePattern struct {
+	fragments   []string
+	requirement string
+}
+
+var policyNamePatterns = []policyNamePattern{
+	{[]string{"allowed-terraform-version", "terraform-version"}, "Upgrade your Terraform version"},
+	{[]string{"restrict-ssh", "no-ssh"}, "Remove SSH (port 22) access from security groups"},
+	{[]string{"required-tags", "enforce-tags"}, "Add required tags to all resources"},
+	{[]string{"allowed-regions", "restrict-regions"}, "Move resources to an approved AWS region"},
+	{[]string{"cost-limit", "budget"}, "Reduce estimated monthly cost below the policy threshold"},
+}
+
+// policyDefaultRequirement is the fallback prose returned by interpretPolicyName
+// when no pattern in policyNamePatterns matches. It points the user at the
+// policy source rather than guessing at semantics from an unfamiliar name.
+const policyDefaultRequirement = "Review the policy source in the HCP Terraform UI to understand the requirements."
+
+// interpretPolicyName runs the policyNamePatterns lookup and returns the
+// matching requirement, or policyDefaultRequirement when nothing matches. Pure
+// function — no I/O.
+func interpretPolicyName(name string) string {
+	lower := strings.ToLower(name)
+	for _, p := range policyNamePatterns {
+		for _, frag := range p.fragments {
+			if strings.Contains(lower, frag) {
+				return p.requirement
+			}
+		}
+	}
+	return policyDefaultRequirement
+}
+
+// interpretFailedPolicies decodes a policycheck list payload, runs each failed
+// entry through the name lookup, and returns a JSON-ready slice. enforcement
+// level is omitted when absent so the agent surfaces only what the API gave us.
+func interpretFailedPolicies(raw []byte) []map[string]any {
+	failed := decodeFailedPolicies(raw)
+	if len(failed) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(failed))
+	for _, fp := range failed {
+		entry := map[string]any{
+			"policy_name": fp.name,
+			"requirement": interpretPolicyName(fp.name),
+		}
+		if fp.enforcementLevel != "" {
+			entry["enforcement_level"] = fp.enforcementLevel
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // classifyRiskFactors groups resources by semantic category (IAM, security

@@ -188,6 +188,104 @@ func TestExtractResourcesRejectsEmailsAndFilenames(t *testing.T) {
 	}
 }
 
+func TestInterpretPolicyName(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"terraform_version_alias", "allowed-terraform-version", "Upgrade your Terraform version"},
+		{"terraform_version_short", "terraform-version", "Upgrade your Terraform version"},
+		{"ssh_restrict", "restrict-ssh", "Remove SSH (port 22) access from security groups"},
+		{"ssh_no", "no-ssh-22", "Remove SSH (port 22) access from security groups"},
+		{"required_tags", "required-tags", "Add required tags to all resources"},
+		{"enforce_tags", "enforce-tags-on-aws", "Add required tags to all resources"},
+		{"allowed_regions", "allowed-regions", "Move resources to an approved AWS region"},
+		{"restrict_regions", "restrict-regions", "Move resources to an approved AWS region"},
+		{"cost_limit", "cost-limit", "Reduce estimated monthly cost below the policy threshold"},
+		{"budget", "monthly-budget", "Reduce estimated monthly cost below the policy threshold"},
+		{"case_insensitive", "Required-Tags-PROD", "Add required tags to all resources"},
+		{"unknown_falls_back", "prod-guardrails-xyz", policyDefaultRequirement},
+		{"empty_falls_back", "", policyDefaultRequirement},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := interpretPolicyName(tc.in)
+			if got != tc.want {
+				t.Fatalf("interpretPolicyName(%q): got %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecodeFailedPolicies(t *testing.T) {
+	raw := []byte(`[
+		{"name":"required-tags","status":"failed","enforcement_level":"hard-mandatory"},
+		{"name":"cost-limit","status":"hard_failed","EnforcementLevel":"soft-mandatory"},
+		{"name":"allowed-regions","status":"passed","enforcement_level":"hard-mandatory"},
+		{"name":"opaque-policy","status":"errored"}
+	]`)
+	got := decodeFailedPolicies(raw)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 failed entries, got %d: %+v", len(got), got)
+	}
+	wantNames := map[string]string{
+		"required-tags":  "hard-mandatory",
+		"cost-limit":     "soft-mandatory",
+		"opaque-policy":  "",
+	}
+	for _, fp := range got {
+		want, ok := wantNames[fp.name]
+		if !ok {
+			t.Fatalf("unexpected policy name in result: %q", fp.name)
+		}
+		if fp.enforcementLevel != want {
+			t.Fatalf("%s enforcement: got %q want %q", fp.name, fp.enforcementLevel, want)
+		}
+	}
+}
+
+func TestDecodeFailedPoliciesEmpty(t *testing.T) {
+	cases := [][]byte{
+		nil,
+		[]byte(``),
+		[]byte(`[]`),
+		[]byte(`[{"name":"required-tags","status":"passed"}]`),
+		[]byte(`not json`),
+	}
+	for i, raw := range cases {
+		if got := decodeFailedPolicies(raw); got != nil {
+			t.Fatalf("case %d: expected nil, got %+v", i, got)
+		}
+	}
+}
+
+func TestInterpretFailedPolicies(t *testing.T) {
+	raw := []byte(`[
+		{"name":"required-tags-prod","status":"failed","enforcement_level":"hard-mandatory"},
+		{"name":"weird-internal-policy","status":"failed"}
+	]`)
+	got := interpretFailedPolicies(raw)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(got))
+	}
+	if got[0]["policy_name"] != "required-tags-prod" {
+		t.Fatalf("entry 0 name: %v", got[0]["policy_name"])
+	}
+	if got[0]["enforcement_level"] != "hard-mandatory" {
+		t.Fatalf("entry 0 enforcement_level: %v", got[0]["enforcement_level"])
+	}
+	if got[0]["requirement"] != "Add required tags to all resources" {
+		t.Fatalf("entry 0 requirement: %v", got[0]["requirement"])
+	}
+	if _, ok := got[1]["enforcement_level"]; ok {
+		t.Fatalf("missing enforcement level should be omitted, got %v", got[1])
+	}
+	if got[1]["requirement"] != policyDefaultRequirement {
+		t.Fatalf("entry 1 should fall back to default; got %v", got[1]["requirement"])
+	}
+}
+
 func TestExtractResourcesFiltersNonResourceTokens(t *testing.T) {
 	line := `{"@module":"terraform.ui","@message":"aws_vpc.main: creating via registry.terraform.io/hashicorp/aws"}`
 	got := extractResources(line, line)

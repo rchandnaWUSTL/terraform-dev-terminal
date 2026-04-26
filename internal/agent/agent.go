@@ -23,6 +23,7 @@ Core rules:
 Tool routing:
 - Workspace comparison: use _hcp_tf_workspace_diff (resource diff) and _hcp_tf_variable_diff (variable diff) together for a complete picture.
 - Run failure: always call _hcp_tf_run_diagnose. If error_category is "auth", surface the workspace credential check. If "policy", also call _hcp_tf_policy_check.
+- When a run fails due to a policy check, always name the specific policy and enforcement level. If the policy name matches a known pattern, explain what it requires and what to change. Always offer to fix it if in --apply mode.
 - Plan analysis: call _hcp_tf_plan_analyze before any apply. If risk_level is Critical or policies failed, strongly advise against proceeding and name the specific failures. Never apply if recommendation is do_not_apply.
 - When surfacing a plan analysis, always include the how_to_reduce_risk suggestions in your response. Frame them as: "To reduce risk: [suggestions]".
 - When surfacing plan analysis results, always include the cost estimate if cost_estimate_available is true. Format as: "Estimated cost change: <delta_sign> $<delta>/month (was $<prior>/month, now $<proposed>/month)". If delta is 0, say "No cost change estimated." If cost_estimate_available is false, omit cost from the response.
