@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1485,6 +1486,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_workspaces_list" {
 		return workspacesListCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_version_audit" {
+		return versionAuditCall(ctx, args, timeoutSec)
+	}
 	if name == "_hcp_tf_stacks_list" {
 		return stacksListCall(ctx, args, timeoutSec)
 	}
@@ -2746,6 +2750,527 @@ func workspacesListCall(ctx context.Context, args map[string]string, timeoutSec 
 	return result
 }
 
+// latestTerraformVersion is the upstream baseline used by versionAuditCall to
+// compute "versions_behind". Bump when a new minor releases on
+// https://github.com/hashicorp/terraform/releases/latest.
+const latestTerraformVersion = "1.14.9"
+
+type advisoryEntry struct {
+	ID       string `json:"id"`
+	Summary  string `json:"summary"`
+	Severity string `json:"severity"`
+	FixedIn  string `json:"fixed_in,omitempty"`
+}
+
+// versionAuditCall groups every workspace in the org by its Terraform version,
+// queries OSV.dev once per unique version for known CVEs, scores upgrade
+// complexity, and returns a structured org-wide audit. Read-only; the OSV
+// fetch degrades gracefully (cve_data_unavailable=true) on any HTTP failure.
+func versionAuditCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_version_audit", Args: args}
+
+	if err := require(args, "org"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	wsResult := workspacesListCall(ctx, map[string]string{"org": args["org"]}, timeoutSec)
+	if wsResult.Err != nil {
+		result.Err = wsResult.Err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var workspaces []map[string]any
+	if err := json.Unmarshal(wsResult.Output, &workspaces); err != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: fmt.Sprintf("could not parse workspaces list: %v", err)}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	type wsInfo struct {
+		name      string
+		resources int
+	}
+	versionToWS := map[string][]wsInfo{}
+	for _, ws := range workspaces {
+		name := firstStringField(ws, "name", "Name")
+		if name == "" {
+			continue
+		}
+		ver := firstStringField(ws, "terraform_version", "TerraformVersion", "terraform-version", "Terraform Version")
+		ver = normalizeTerraformVersion(ver)
+		if ver == "" {
+			ver = "unknown"
+		}
+		versionToWS[ver] = append(versionToWS[ver], wsInfo{
+			name:      name,
+			resources: firstIntField(ws, "resource_count", "ResourceCount", "resource-count"),
+		})
+	}
+
+	advisoryCache := map[string][]advisoryEntry{}
+	cveDataUnavailable := false
+	type osvResult struct {
+		version string
+		entries []advisoryEntry
+		failed  bool
+	}
+	var mu sync.Mutex
+	var owg sync.WaitGroup
+	results := make([]osvResult, 0, len(versionToWS))
+	sem := make(chan struct{}, 8)
+	for ver := range versionToWS {
+		if ver == "unknown" {
+			advisoryCache[ver] = nil
+			continue
+		}
+		owg.Add(1)
+		go func(v string) {
+			defer owg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			entries, fetchErr := fetchOSVAdvisories(ctx, v, timeoutSec)
+			mu.Lock()
+			results = append(results, osvResult{version: v, entries: entries, failed: fetchErr})
+			mu.Unlock()
+		}(ver)
+	}
+	owg.Wait()
+	for _, r := range results {
+		advisoryCache[r.version] = r.entries
+		if r.failed {
+			cveDataUnavailable = true
+		}
+	}
+
+	summaries := make([]summaryEntry, 0, len(versionToWS))
+	atRisk := 0
+	for ver, list := range versionToWS {
+		names := make([]string, 0, len(list))
+		maxResources := 0
+		for _, w := range list {
+			names = append(names, w.name)
+			if w.resources > maxResources {
+				maxResources = w.resources
+			}
+		}
+		sort.Strings(names)
+
+		behind := versionsBehind(ver, latestTerraformVersion)
+		majorJump := majorComponent(ver) >= 0 && majorComponent(ver) < majorComponent(latestTerraformVersion)
+		cves := advisoryCache[ver]
+		highestSev := highestSeverity(cves)
+
+		complexity := upgradeComplexity(maxResources, behind, majorJump)
+
+		status := "current"
+		if behind > 5 || majorJump || highestSev == "high" || highestSev == "critical" {
+			status = "critical"
+		} else if behind >= 2 || (behind > 0 && len(cves) > 0) || highestSev == "low" || highestSev == "medium" {
+			status = "outdated"
+		}
+		if ver == "unknown" {
+			status = "outdated"
+		}
+		if status != "current" {
+			atRisk += len(list)
+		}
+
+		notes := upgradeNotes(ver, latestTerraformVersion, behind, majorJump, len(cves))
+
+		summaries = append(summaries, summaryEntry{
+			TerraformVersion:  ver,
+			WorkspaceCount:    len(list),
+			Workspaces:        names,
+			Status:            status,
+			VersionsBehind:    behind,
+			KnownCVEs:         cves,
+			CVECount:          len(cves),
+			UpgradeComplexity: complexity,
+			UpgradeNotes:      notes,
+		})
+	}
+
+	sort.SliceStable(summaries, func(i, j int) bool {
+		if summaries[i].VersionsBehind != summaries[j].VersionsBehind {
+			return summaries[i].VersionsBehind > summaries[j].VersionsBehind
+		}
+		return summaries[i].TerraformVersion < summaries[j].TerraformVersion
+	})
+
+	recommendation := buildRecommendation(summaries, cveDataUnavailable)
+
+	out := map[string]any{
+		"org":                      args["org"],
+		"workspace_count":          len(workspaces),
+		"version_summary":          summaries,
+		"latest_terraform_version": latestTerraformVersion,
+		"workspaces_at_risk":       atRisk,
+		"recommendation":           recommendation,
+		"cve_data_unavailable":     cveDataUnavailable,
+	}
+
+	body, mErr := json.Marshal(out)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(body)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// normalizeTerraformVersion strips constraint prefixes and the leading "v" so
+// values like "~>1.14.0", ">= 1.5.0", or "v1.5.0" become "1.14.0" / "1.5.0".
+// hcptf surfaces both pinned versions and Terraform CLI constraint operators
+// in the same field; we collapse to the underlying version for OSV lookups.
+func normalizeTerraformVersion(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	for _, prefix := range []string{"~>", ">=", "<=", "==", "=", "<", ">", "v", "V"} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+		}
+	}
+	return s
+}
+
+// fetchOSVAdvisories POSTs a single Terraform version to OSV.dev /v1/query.
+// Returns (entries, false) on success, (nil, true) when OSV is unreachable or
+// returns an unparseable body. Server-side version matching means the response
+// only contains vulns affecting the queried version, so no client-side range
+// parser is needed.
+func fetchOSVAdvisories(ctx context.Context, version string, timeoutSec int) ([]advisoryEntry, bool) {
+	// Per-query budget capped at 10s — OSV is fast and we'd rather degrade
+	// gracefully on a stuck query than hold the whole audit hostage.
+	perQuery := 10 * time.Second
+	if d := time.Duration(timeoutSec) * time.Second; d > 0 && d < perQuery {
+		perQuery = d
+	}
+	cctx, cancel := context.WithTimeout(ctx, perQuery)
+	defer cancel()
+
+	body := []byte(fmt.Sprintf(`{"version":%q,"package":{"name":"github.com/hashicorp/terraform","ecosystem":"Go"}}`, version))
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, "https://api.osv.dev/v1/query", bytes.NewReader(body))
+	if err != nil {
+		return nil, true
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "tfpilot/1.5")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, true
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, true
+	}
+	if looksLikeHTML(string(raw)) {
+		return nil, true
+	}
+	entries, parseErr := parseOSVResponse(raw)
+	if parseErr {
+		return nil, true
+	}
+	return entries, false
+}
+
+// parseOSVResponse extracts advisoryEntry values from an OSV.dev /v1/query
+// response body. It tolerates partially populated vulns (no severity, no fix
+// event) without erroring; only a JSON parse failure on the outer wrapper
+// reports an error. Split out from fetchOSVAdvisories so tests can exercise
+// the parsing logic without hitting the network.
+func parseOSVResponse(raw []byte) ([]advisoryEntry, bool) {
+	var wrapper struct {
+		Vulns []struct {
+			ID       string `json:"id"`
+			Summary  string `json:"summary"`
+			Aliases  []string `json:"aliases"`
+			Database struct {
+				Severity string `json:"severity"`
+			} `json:"database_specific"`
+			Affected []struct {
+				Ranges []struct {
+					Events []map[string]string `json:"events"`
+				} `json:"ranges"`
+			} `json:"affected"`
+		} `json:"vulns"`
+	}
+	if err := json.Unmarshal(raw, &wrapper); err != nil {
+		return nil, true
+	}
+
+	out := make([]advisoryEntry, 0, len(wrapper.Vulns))
+	seen := map[string]bool{}
+	for _, v := range wrapper.Vulns {
+		id := v.ID
+		// Prefer the canonical CVE id when present in aliases — it's more
+		// recognizable to operators than a GHSA-* or GO-* id.
+		for _, alias := range v.Aliases {
+			if strings.HasPrefix(alias, "CVE-") {
+				id = alias
+				break
+			}
+		}
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+
+		fixed := ""
+		for _, aff := range v.Affected {
+			for _, r := range aff.Ranges {
+				for _, ev := range r.Events {
+					if f, ok := ev["fixed"]; ok && f != "" {
+						if fixed == "" || compareSemver(f, fixed) < 0 {
+							fixed = f
+						}
+					}
+				}
+			}
+		}
+
+		out = append(out, advisoryEntry{
+			ID:       id,
+			Summary:  v.Summary,
+			Severity: normalizeSeverity(v.Database.Severity),
+			FixedIn:  fixed,
+		})
+	}
+	return out, false
+}
+
+// normalizeSeverity maps OSV's database_specific.severity values
+// (LOW/MODERATE/MEDIUM/HIGH/CRITICAL) to tfpilot's lowercase taxonomy.
+// Empty or unrecognized inputs become "unknown".
+func normalizeSeverity(s string) string {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "LOW":
+		return "low"
+	case "MODERATE", "MEDIUM":
+		return "medium"
+	case "HIGH":
+		return "high"
+	case "CRITICAL":
+		return "critical"
+	default:
+		return "unknown"
+	}
+}
+
+// compareSemver returns -1, 0, or 1 for a vs b on a 3-component dotted version
+// (major.minor.patch). Any parse failure on a component degrades to lexical
+// compare on that component, which preserves a sane ordering for "unknown" or
+// truncated versions without erroring.
+func compareSemver(a, b string) int {
+	pa := strings.Split(strings.TrimPrefix(a, "v"), ".")
+	pb := strings.Split(strings.TrimPrefix(b, "v"), ".")
+	for i := 0; i < 3; i++ {
+		var ai, bi int
+		var aerr, berr error
+		if i < len(pa) {
+			ai, aerr = strconv.Atoi(pa[i])
+		}
+		if i < len(pb) {
+			bi, berr = strconv.Atoi(pb[i])
+		}
+		if aerr != nil || berr != nil {
+			as := ""
+			bs := ""
+			if i < len(pa) {
+				as = pa[i]
+			}
+			if i < len(pb) {
+				bs = pb[i]
+			}
+			if as < bs {
+				return -1
+			}
+			if as > bs {
+				return 1
+			}
+			continue
+		}
+		if ai != bi {
+			if ai < bi {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func majorComponent(v string) int {
+	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
+	if len(parts) == 0 {
+		return -1
+	}
+	n, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+func minorComponent(v string) int {
+	parts := strings.Split(strings.TrimPrefix(v, "v"), ".")
+	if len(parts) < 2 {
+		return -1
+	}
+	n, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// versionsBehind returns the minor-version delta between current and latest
+// (latest.minor - current.minor). Returns 0 when current is unparseable so
+// a missing version doesn't get scored as catastrophically behind by accident.
+func versionsBehind(current, latest string) int {
+	cm := minorComponent(current)
+	lm := minorComponent(latest)
+	if cm < 0 || lm < 0 {
+		return 0
+	}
+	delta := lm - cm
+	if delta < 0 {
+		return 0
+	}
+	return delta
+}
+
+// upgradeComplexity scores per-version-group upgrade effort. Inputs are the
+// max workspace resource count in the group, the minor-version delta from
+// latest, and whether a major bump is involved. Scale matches the v1.5 spec:
+// Low (<10 resources, <2 behind), Medium (10–50 OR 2–5 behind),
+// High (>50 OR major jump OR >5 behind).
+func upgradeComplexity(resources, behind int, majorJump bool) string {
+	if resources > 50 || majorJump || behind > 5 {
+		return "High"
+	}
+	if resources >= 10 || behind >= 2 {
+		return "Medium"
+	}
+	return "Low"
+}
+
+func highestSeverity(cves []advisoryEntry) string {
+	rank := map[string]int{"unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+	highest := "unknown"
+	for _, c := range cves {
+		if rank[c.Severity] > rank[highest] {
+			highest = c.Severity
+		}
+	}
+	return highest
+}
+
+func upgradeNotes(current, latest string, behind int, majorJump bool, cveCount int) string {
+	if current == "unknown" {
+		return "Workspace has no Terraform version pinned — set one explicitly."
+	}
+	if majorJump {
+		return fmt.Sprintf("Major version bump from %s to %s. Review the upgrade guide and re-test all modules.", current, latest)
+	}
+	if behind >= 5 {
+		return fmt.Sprintf("More than 5 minor versions behind %s. Plan an incremental upgrade through the intermediate releases.", latest)
+	}
+	if behind >= 2 {
+		return fmt.Sprintf("%d minor versions behind %s. Upgrade should be straightforward but re-run plans on a non-prod workspace first.", behind, latest)
+	}
+	if cveCount > 0 {
+		return fmt.Sprintf("Within range of %s but a known CVE applies. Patch by upgrading to the listed fixed version.", latest)
+	}
+	return fmt.Sprintf("Within 2 minor versions of %s. No urgent action.", latest)
+}
+
+func buildRecommendation(summaries []summaryEntry, cveDataUnavailable bool) string {
+	criticalWithCVE := summaryEntry{}
+	criticalNoCVE := summaryEntry{}
+	outdated := summaryEntry{}
+	hasCriticalWithCVE := false
+	hasCriticalNoCVE := false
+	hasOutdated := false
+
+	for _, s := range summaries {
+		if s.Status == "critical" && s.CVECount > 0 && !hasCriticalWithCVE {
+			criticalWithCVE = s
+			hasCriticalWithCVE = true
+		}
+		if s.Status == "critical" && s.CVECount == 0 && !hasCriticalNoCVE {
+			criticalNoCVE = s
+			hasCriticalNoCVE = true
+		}
+		if s.Status == "outdated" && !hasOutdated {
+			outdated = s
+			hasOutdated = true
+		}
+	}
+
+	var msg string
+	switch {
+	case hasCriticalWithCVE:
+		msg = fmt.Sprintf("Upgrade %s from %s to address %d known CVE(s) including %s.",
+			strings.Join(criticalWithCVE.Workspaces, ", "),
+			criticalWithCVE.TerraformVersion,
+			criticalWithCVE.CVECount,
+			highestSeverityID(criticalWithCVE.KnownCVEs))
+	case hasCriticalNoCVE:
+		msg = fmt.Sprintf("%d workspace(s) are running Terraform %s, more than 5 minor versions behind %s. Plan an upgrade path.",
+			criticalNoCVE.WorkspaceCount, criticalNoCVE.TerraformVersion, latestTerraformVersion)
+	case hasOutdated:
+		msg = fmt.Sprintf("%s on %s are behind. Upgrade when convenient.",
+			strings.Join(outdated.Workspaces, ", "), outdated.TerraformVersion)
+	default:
+		msg = fmt.Sprintf("All workspaces within 2 minor versions of %s. No urgent action.", latestTerraformVersion)
+	}
+
+	if cveDataUnavailable {
+		if hasCriticalWithCVE {
+			msg += " Note: some OSV.dev queries did not complete; CVE coverage may be incomplete on other versions."
+		} else {
+			msg += " CVE data unavailable — OSV.dev unreachable."
+		}
+	}
+	return msg
+}
+
+func highestSeverityID(cves []advisoryEntry) string {
+	rank := map[string]int{"unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+	bestID := ""
+	best := -1
+	for _, c := range cves {
+		if rank[c.Severity] > best {
+			best = rank[c.Severity]
+			bestID = c.ID
+		}
+	}
+	return bestID
+}
+
+type summaryEntry struct {
+	TerraformVersion  string          `json:"terraform_version"`
+	WorkspaceCount    int             `json:"workspace_count"`
+	Workspaces        []string        `json:"workspaces"`
+	Status            string          `json:"status"`
+	VersionsBehind    int             `json:"versions_behind"`
+	KnownCVEs         []advisoryEntry `json:"known_cves"`
+	CVECount          int             `json:"cve_count"`
+	UpgradeComplexity string          `json:"upgrade_complexity"`
+	UpgradeNotes      string          `json:"upgrade_notes"`
+}
+
 // stacksListCall shells out to `hcptf stack list` and enriches each stack
 // with deployment_count and health by fanning out parallel
 // `stack deployment list` calls. The base `stack list` payload only includes
@@ -3224,6 +3749,18 @@ func Definitions() []ToolDef {
 				"type": "object",
 				"properties": map[string]any{
 					"org": map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+				},
+				"required": []string{"org"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_version_audit",
+			Description: "Audits Terraform versions across all workspaces in an organization. Groups workspaces by Terraform version, queries OSV.dev (https://api.osv.dev/v1/query) for known CVEs affecting each version, and scores upgrade complexity (Low|Medium|High). Returns version_summary, workspaces_at_risk count, and a plain-English recommendation. Read-only; degrades gracefully when OSV.dev is unreachable.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":         map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"min_version": map[string]any{"type": "string", "description": "Optional baseline (defaults to 1.5.0)"},
 				},
 				"required": []string{"org"},
 			},

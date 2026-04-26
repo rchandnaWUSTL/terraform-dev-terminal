@@ -137,11 +137,11 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Staleness analysis: workspaces with no runs in N days, drifted resources, abandoned configs
 - Persona-aware responses: Admin, Engineer, and App Dev personas get different levels of detail and different suggested next actions
 
-## v1.5 — Org Health Audit
-- Terraform version audit across all workspaces: surfaces outdated versions and upgrade paths
-- Known vulnerability checking per Terraform version against the CVE database
-- Module version checking with Terraform Registry integration: flags outdated or deprecated modules
-- Upgrade complexity assessment: estimates effort to upgrade each workspace based on resource count, provider deps, and module usage
+## v1.5 — Org Health Audit (In Progress)
+- _hcp_tf_version_audit tool: groups all workspaces by Terraform version, surfaces CVEs from OSV.dev, and scores upgrade complexity per version group
+- /audit slash command: human-readable version + CVE summary for the pinned org
+- Graceful degradation: tool still returns version groupings if OSV.dev is unreachable
+- Module version checking and full upgrade-effort scoring deferred to v1.5.1
 
 ## v1.6 — Plan Analyzer v2
 - `how_to_reduce_risk` field per risk factor: concrete, actionable suggestions for making a High or Critical plan safer before applying

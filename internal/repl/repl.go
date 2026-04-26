@@ -157,6 +157,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleOwner()
 	case "/stacks":
 		r.handleStacks()
+	case "/audit":
+		r.handleAudit()
 	case "/workspaces":
 		r.handleWorkspaces(parts[1:])
 	default:
@@ -671,6 +673,108 @@ func (r *REPL) handleStacks() {
 		default:
 			dimWhite.Println(health)
 		}
+	}
+}
+
+// handleAudit implements /audit by calling _hcp_tf_version_audit for the
+// pinned org. Workspaces are grouped by Terraform version with status,
+// CVE, and upgrade-complexity rendering. Read-only; visible in every mode.
+func (r *REPL) handleAudit() {
+	if r.org == "" {
+		boundaryPink.Println("Set an org first with /org <name>")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_version_audit", map[string]string{"org": r.org}, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_version_audit: %s\n", result.Err.Message)
+		return
+	}
+
+	type cveRow struct {
+		ID       string `json:"id"`
+		Summary  string `json:"summary"`
+		Severity string `json:"severity"`
+		FixedIn  string `json:"fixed_in"`
+	}
+	type versionRow struct {
+		TerraformVersion  string   `json:"terraform_version"`
+		WorkspaceCount    int      `json:"workspace_count"`
+		Workspaces        []string `json:"workspaces"`
+		Status            string   `json:"status"`
+		VersionsBehind    int      `json:"versions_behind"`
+		KnownCVEs         []cveRow `json:"known_cves"`
+		CVECount          int      `json:"cve_count"`
+		UpgradeComplexity string   `json:"upgrade_complexity"`
+		UpgradeNotes      string   `json:"upgrade_notes"`
+	}
+	var payload struct {
+		Org                    string       `json:"org"`
+		WorkspaceCount         int          `json:"workspace_count"`
+		VersionSummary         []versionRow `json:"version_summary"`
+		LatestTerraformVersion string       `json:"latest_terraform_version"`
+		WorkspacesAtRisk       int          `json:"workspaces_at_risk"`
+		Recommendation         string       `json:"recommendation"`
+		CVEDataUnavailable     bool         `json:"cve_data_unavailable"`
+	}
+	if err := json.Unmarshal(result.Output, &payload); err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_version_audit: could not parse output: %v\n", err)
+		return
+	}
+
+	bold.Printf("  Terraform Version Audit — %s\n", payload.Org)
+	fmt.Println()
+	dimWhite.Printf("  %d workspaces audited across %d unique versions (latest is %s).\n",
+		payload.WorkspaceCount, len(payload.VersionSummary), payload.LatestTerraformVersion)
+	if payload.CVEDataUnavailable {
+		vaultYellow.Println("  CVE data unavailable — OSV.dev unreachable. Showing version groupings only.")
+	}
+	fmt.Println()
+
+	for _, v := range payload.VersionSummary {
+		icon := "✓"
+		if v.Status == "critical" || v.Status == "outdated" {
+			icon = "⚠"
+		}
+		headerLine := fmt.Sprintf("  %s %s — %d workspace(s) — %d CVE(s) — %s upgrade complexity\n",
+			icon, v.TerraformVersion, v.WorkspaceCount, v.CVECount, v.UpgradeComplexity)
+		switch v.Status {
+		case "critical":
+			boundaryPink.Print(headerLine)
+		case "outdated":
+			vaultYellow.Print(headerLine)
+		default:
+			waypointTeal.Print(headerLine)
+		}
+		fmt.Printf("    Workspaces: %s\n", strings.Join(v.Workspaces, ", "))
+		for _, c := range v.KnownCVEs {
+			fix := ""
+			if c.FixedIn != "" {
+				fix = fmt.Sprintf(" (fixed in %s)", c.FixedIn)
+			}
+			line := fmt.Sprintf("    %s (%s)%s — %s\n", c.ID, c.Severity, fix, c.Summary)
+			switch c.Severity {
+			case "critical", "high":
+				boundaryPink.Print(line)
+			case "medium":
+				vaultYellow.Print(line)
+			default:
+				dimWhite.Print(line)
+			}
+		}
+		dimWhite.Printf("    Upgrade notes: %s\n", v.UpgradeNotes)
+		fmt.Println()
+	}
+
+	if payload.WorkspacesAtRisk > 0 {
+		bold.Printf("  Most urgent: %s\n", payload.Recommendation)
+	} else {
+		waypointTeal.Printf("  %s\n", payload.Recommendation)
 	}
 }
 
@@ -1396,6 +1500,7 @@ func printHelp() {
 	fmt.Println("  /owner             Show metadata and VCS info for the pinned workspace")
 	fmt.Println("  /workspaces [filter]   List workspaces in the pinned org (optional name filter)")
 	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
+	fmt.Println("  /audit             Terraform version + CVE audit across all workspaces")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")

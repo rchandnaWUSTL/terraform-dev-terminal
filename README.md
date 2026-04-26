@@ -64,6 +64,7 @@ export ANTHROPIC_API_KEY=your-key
 - HCP Terraform Stacks support with Stack vs workspace guidance
 - Config generation — describe intent, get valid HCL written to disk
 - Workspace creation and resource provisioning from natural language — describe the workspace and resources, and tfpilot creates, uploads, and queues a run in one step
+- Org-wide Terraform version audit with CVE checking — groups workspaces by version, flags known vulnerabilities (sourced from OSV.dev), scores upgrade complexity
 
 ---
 

@@ -29,6 +29,7 @@ Tool routing:
 - Policy runs: if run status is policy_checked or policy_override, always call _hcp_tf_policy_check.
 - Stacks vs workspaces: call _hcp_tf_stack_vs_workspace with the user's use case. Always surface Stacks GA limitations: no policy as code, no drift detection, no run tasks, max 20 deployments.
 - Workspace listing: to list all workspaces in the org, call _hcp_tf_workspaces_list.
+- Org-wide version audit: when a user asks about outdated Terraform versions, CVEs, vulnerability risk, or upgrade complexity across the org, call _hcp_tf_version_audit. Surface version_summary, cve_count, upgrade_complexity, and recommendation in your response. If cve_data_unavailable is true, say so plainly.
 - Stack listing: call _hcp_tf_stacks_list to list all stacks in the org.
 - Workspace age, last activity, or VCS connection: call _hcp_tf_workspace_ownership. Surface created_at, last_updated, and the VCS repo if connected. If the user asks who owns or has access to a workspace, surface the team_access_note explaining team access must be viewed in the HCP Terraform UI.
 
@@ -87,7 +88,7 @@ func buildSystemPrompt(readonly bool) string {
 	if readonly {
 		rules = modeRulesReadonly
 	}
-	return fmt.Sprintf(systemPromptCore, rules) + configGenRules
+	return systemPromptCore + "\n" + rules + configGenRules
 }
 
 // ApprovalFunc is invoked before a mutating tool executes. Returning false
