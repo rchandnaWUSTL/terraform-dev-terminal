@@ -171,7 +171,17 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - After a batch finishes (completed, stopped, or all-skipped) the report is generated automatically — /report is the explicit retry path.
 - System prompt rule: "fix the rest" / "upgrade all" / "fix remaining" route to _hcp_tf_batch_upgrade with the workspace list from the prior version_audit; the agent emits exactly one acknowledgement sentence and never loops over workspaces itself.
 
-## v1.8 — Observability and Metrics
+## v1.8 — Autonomous Compliance Mode (In Progress)
+- Single-prompt compliance remediation: one sentence ("make my infrastructure secure and compliant before tomorrow's review", "get us audit-ready", "are we ready for review") triggers a full org vulnerability scan, prioritized findings, and a remediation offer
+- _hcp_tf_compliance_summary tool: org-wide compliance posture snapshot with severity-weighted compliance_score (0-100), top_cves rolled up across all workspaces, remediation_priority list ordered by severity → resource count → prod-name signal, and a plain-English verdict
+- Internally fans out version_audit; opt-in top-3-by-resource provider_audit fan-out triggered by depth phrasing ("deep audit", "full review", "thorough scan") so the default response stays fast
+- Degrades gracefully: provider_data_partial=true on per-workspace provider audit failures; cve_data_unavailable=true when OSV is unreachable, returning compliance_score=null with an "indeterminate" verdict instead of failing the tool
+- Intent detection: agent recognizes broad compliance/audit/security-posture intent regardless of phrasing and routes to compliance_summary as the first tool call; routing example sentences appended to single-workspace and batch remediation rules so "fix the most critical one" resolves remediation_priority[0].workspace and "fix the rest" passes the same workspace list
+- Compliance verdict framing: ✓ / ⚠ / ✗ verdicts banded by score (>=90, 70-89, <70, null), severity grouping rendered as plain prose to honor the agent's no-bullets response format
+- Integrates with v1.5 single-workspace remediation ("fix the most critical one") and v1.7 batch remediation ("fix the rest") for the follow-up fix cycle
+- Read-only — does NOT auto-remediate; findings always presented first, remediation requires explicit user follow-up under --apply mode
+
+## v1.9 — Observability and Metrics
 - Usage analytics: sessions per workspace, tool call frequency, apply success rates
 - Audit log visualization: searchable, filterable view of ~/.tfpilot/audit.log entries
 - Agent call patterns: which tools are invoked together, which prompts lead to applies vs. read-only sessions

@@ -1688,6 +1688,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_compliance_report" {
 		return complianceReportCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_compliance_summary" {
+		return complianceSummaryCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -2592,6 +2595,403 @@ func complianceReportCall(ctx context.Context, args map[string]string, timeoutSe
 	_ = ctx
 	_ = timeoutSec
 	return result
+}
+
+// complianceSummaryCall produces an org-wide compliance posture snapshot:
+// runs versionAuditCall to discover Terraform CVEs, optionally fans out
+// providerAuditCall on the top-3 highest-resource at-risk workspaces, then
+// derives a severity-weighted compliance_score, top_cves, remediation_priority,
+// and a plain-English compliance_verdict. Read-only.
+func complianceSummaryCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_compliance_summary", Args: args}
+
+	if err := require(args, "org"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	includeProviders := strings.EqualFold(strings.TrimSpace(args["include_providers"]), "true")
+
+	auditResult := versionAuditCall(ctx, map[string]string{"org": org}, timeoutSec)
+	if auditResult.Err != nil {
+		result.Err = auditResult.Err
+		result.Duration = time.Since(start)
+		return result
+	}
+	var auditOut struct {
+		Org                    string         `json:"org"`
+		WorkspaceCount         int            `json:"workspace_count"`
+		VersionSummary         []summaryEntry `json:"version_summary"`
+		LatestTerraformVersion string         `json:"latest_terraform_version"`
+		WorkspacesAtRisk       int            `json:"workspaces_at_risk"`
+		CVEDataUnavailable     bool           `json:"cve_data_unavailable"`
+	}
+	if err := json.Unmarshal(auditResult.Output, &auditOut); err != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: "decode audit output: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	wsListResult := workspacesListCall(ctx, map[string]string{"org": org}, timeoutSec)
+	resourceCount := map[string]int{}
+	if wsListResult.Err == nil {
+		var workspaces []map[string]any
+		if err := json.Unmarshal(wsListResult.Output, &workspaces); err == nil {
+			for _, ws := range workspaces {
+				name := firstStringField(ws, "name", "Name")
+				if name == "" {
+					continue
+				}
+				resourceCount[name] = firstIntField(ws, "resource_count", "ResourceCount", "resource-count")
+			}
+		}
+	}
+
+	type wsRecord struct {
+		Workspace       string
+		Version         string
+		Status          string
+		CVEs            []advisoryEntry
+		HighestSeverity string
+		ResourceCount   int
+		IsProd          bool
+	}
+
+	records := make([]wsRecord, 0, auditOut.WorkspaceCount)
+	for _, group := range auditOut.VersionSummary {
+		highest := highestSeverity(group.KnownCVEs)
+		for _, name := range group.Workspaces {
+			rc := resourceCount[name]
+			records = append(records, wsRecord{
+				Workspace:       name,
+				Version:         group.TerraformVersion,
+				Status:          group.Status,
+				CVEs:            group.KnownCVEs,
+				HighestSeverity: highest,
+				ResourceCount:   rc,
+				IsProd:          strings.Contains(strings.ToLower(name), "prod"),
+			})
+		}
+	}
+
+	var compliancePtr *int
+	var compliantWorkspaces, atRiskWorkspaces, criticalWorkspaces int
+	if !auditOut.CVEDataUnavailable {
+		var weightSum, weightCount int
+		for _, r := range records {
+			isCritical := false
+			switch r.HighestSeverity {
+			case "critical", "high":
+				isCritical = true
+			default:
+				if r.IsProd && len(r.CVEs) > 0 {
+					isCritical = true
+				}
+			}
+			isAtRisk := r.Status != "current" || len(r.CVEs) > 0 || r.Version == "unknown"
+			if !isAtRisk {
+				compliantWorkspaces++
+			} else {
+				atRiskWorkspaces++
+			}
+			if isCritical {
+				criticalWorkspaces++
+			}
+
+			if r.Version == "unknown" {
+				continue
+			}
+			var weight int
+			switch r.HighestSeverity {
+			case "critical":
+				weight = 0
+			case "high":
+				weight = 25
+			case "medium", "moderate":
+				weight = 50
+			case "low":
+				weight = 75
+			default:
+				weight = 100
+			}
+			weightSum += weight
+			weightCount++
+		}
+		if weightCount > 0 {
+			score := weightSum / weightCount
+			compliancePtr = &score
+		} else {
+			zero := 0
+			compliancePtr = &zero
+		}
+	} else {
+		for _, r := range records {
+			if r.Status == "current" && r.Version != "unknown" {
+				compliantWorkspaces++
+			} else {
+				atRiskWorkspaces++
+			}
+			if r.IsProd && r.Status != "current" {
+				criticalWorkspaces++
+			}
+		}
+	}
+
+	type cveAgg struct {
+		ID                 string `json:"id"`
+		Severity           string `json:"severity"`
+		Summary            string `json:"summary,omitempty"`
+		AffectedWorkspaces int    `json:"affected_workspaces"`
+	}
+	cveByID := map[string]*cveAgg{}
+	for _, group := range auditOut.VersionSummary {
+		for _, cve := range group.KnownCVEs {
+			if cve.ID == "" {
+				continue
+			}
+			agg, ok := cveByID[cve.ID]
+			if !ok {
+				agg = &cveAgg{ID: cve.ID, Severity: cve.Severity, Summary: cve.Summary}
+				cveByID[cve.ID] = agg
+			}
+			agg.AffectedWorkspaces += group.WorkspaceCount
+			if severityRank(cve.Severity) > severityRank(agg.Severity) {
+				agg.Severity = cve.Severity
+			}
+		}
+	}
+	topCVEs := make([]cveAgg, 0, len(cveByID))
+	for _, v := range cveByID {
+		topCVEs = append(topCVEs, *v)
+	}
+	sort.SliceStable(topCVEs, func(i, j int) bool {
+		ri, rj := severityRank(topCVEs[i].Severity), severityRank(topCVEs[j].Severity)
+		if ri != rj {
+			return ri > rj
+		}
+		if topCVEs[i].AffectedWorkspaces != topCVEs[j].AffectedWorkspaces {
+			return topCVEs[i].AffectedWorkspaces > topCVEs[j].AffectedWorkspaces
+		}
+		return topCVEs[i].ID < topCVEs[j].ID
+	})
+	if len(topCVEs) > 5 {
+		topCVEs = topCVEs[:5]
+	}
+
+	type priorityEntry struct {
+		Workspace       string `json:"workspace"`
+		CurrentVersion  string `json:"current_version"`
+		CVECount        int    `json:"cve_count"`
+		HighestSeverity string `json:"highest_severity"`
+		ResourceCount   int    `json:"resource_count"`
+		IsProd          bool   `json:"is_prod"`
+		Urgency         string `json:"urgency"`
+		Reason          string `json:"reason"`
+	}
+	atRisk := make([]wsRecord, 0, len(records))
+	for _, r := range records {
+		if r.Status == "current" && len(r.CVEs) == 0 && r.Version != "unknown" {
+			continue
+		}
+		atRisk = append(atRisk, r)
+	}
+	sort.SliceStable(atRisk, func(i, j int) bool {
+		ri, rj := severityRank(atRisk[i].HighestSeverity), severityRank(atRisk[j].HighestSeverity)
+		if ri != rj {
+			return ri > rj
+		}
+		if atRisk[i].ResourceCount != atRisk[j].ResourceCount {
+			return atRisk[i].ResourceCount > atRisk[j].ResourceCount
+		}
+		if atRisk[i].IsProd != atRisk[j].IsProd {
+			return atRisk[i].IsProd
+		}
+		return atRisk[i].Workspace < atRisk[j].Workspace
+	})
+	priorityList := make([]priorityEntry, 0, 5)
+	limit := 5
+	if len(atRisk) < limit {
+		limit = len(atRisk)
+	}
+	for _, r := range atRisk[:limit] {
+		urgency := "medium"
+		switch r.HighestSeverity {
+		case "critical", "high":
+			urgency = "critical"
+		case "medium", "moderate":
+			urgency = "high"
+		case "low":
+			urgency = "medium"
+		}
+		if r.IsProd && len(r.CVEs) > 0 && urgency != "critical" {
+			urgency = "critical"
+		}
+		var reason string
+		switch {
+		case r.IsProd && len(r.CVEs) > 0:
+			topID := ""
+			if len(r.CVEs) > 0 {
+				topID = r.CVEs[0].ID
+				for _, c := range r.CVEs {
+					if severityRank(c.Severity) > severityRank(r.HighestSeverity)-1 && c.ID != "" {
+						topID = c.ID
+						break
+					}
+				}
+			}
+			reason = fmt.Sprintf("Production workspace with %d resource%s affected by %s", r.ResourceCount, plural(r.ResourceCount), topID)
+		case len(r.CVEs) > 0:
+			reason = fmt.Sprintf("%d resource%s on Terraform %s with %d known CVE%s (%s)", r.ResourceCount, plural(r.ResourceCount), r.Version, len(r.CVEs), plural(len(r.CVEs)), r.HighestSeverity)
+		case r.Version == "unknown":
+			reason = "No Terraform version pinned — set one explicitly"
+		default:
+			reason = fmt.Sprintf("Outdated Terraform version %s with %d resource%s", r.Version, r.ResourceCount, plural(r.ResourceCount))
+		}
+		priorityList = append(priorityList, priorityEntry{
+			Workspace:       r.Workspace,
+			CurrentVersion:  r.Version,
+			CVECount:        len(r.CVEs),
+			HighestSeverity: r.HighestSeverity,
+			ResourceCount:   r.ResourceCount,
+			IsProd:          r.IsProd,
+			Urgency:         urgency,
+			Reason:          reason,
+		})
+	}
+
+	type providerAuditOut struct {
+		Workspace         string          `json:"workspace"`
+		ProvidersWithCVEs []providerBrief `json:"providers_with_cves"`
+		ErrorCode         string          `json:"error_code,omitempty"`
+	}
+	providerAudits := []providerAuditOut{}
+	providerDataPartial := false
+	if includeProviders && len(atRisk) > 0 {
+		topN := 3
+		if len(atRisk) < topN {
+			topN = len(atRisk)
+		}
+		audits := make([]providerAuditOut, topN)
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, topN)
+		for i := 0; i < topN; i++ {
+			i := i
+			ws := atRisk[i].Workspace
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				pr := providerAuditCall(ctx, map[string]string{"org": org, "workspace": ws}, timeoutSec)
+				out := providerAuditOut{Workspace: ws, ProvidersWithCVEs: []providerBrief{}}
+				if pr.Err != nil {
+					out.ErrorCode = pr.Err.ErrorCode
+					audits[i] = out
+					return
+				}
+				var pa struct {
+					Providers []struct {
+						Name              string          `json:"name"`
+						RegistryPath      string          `json:"registry_path"`
+						PinnedVersion     string          `json:"pinned_version"`
+						LatestVersion     string          `json:"latest_version"`
+						CurrentlyAffected []advisoryEntry `json:"currently_affected"`
+						UpgradingFixes    []advisoryEntry `json:"upgrading_fixes"`
+					} `json:"providers"`
+					CVEDataUnavailable bool `json:"cve_data_unavailable"`
+				}
+				if uerr := json.Unmarshal(pr.Output, &pa); uerr != nil {
+					out.ErrorCode = "parse_error"
+					audits[i] = out
+					return
+				}
+				if pa.CVEDataUnavailable {
+					out.ErrorCode = "cve_data_unavailable"
+				}
+				for _, p := range pa.Providers {
+					if len(p.CurrentlyAffected) == 0 && len(p.UpgradingFixes) == 0 {
+						continue
+					}
+					out.ProvidersWithCVEs = append(out.ProvidersWithCVEs, providerBrief{
+						Name:              p.Name,
+						RegistryPath:      p.RegistryPath,
+						PinnedVersion:     p.PinnedVersion,
+						LatestVersion:     p.LatestVersion,
+						CurrentlyAffected: len(p.CurrentlyAffected),
+						UpgradingFixes:    len(p.UpgradingFixes),
+					})
+				}
+				audits[i] = out
+			}()
+		}
+		wg.Wait()
+		for _, a := range audits {
+			if a.ErrorCode != "" {
+				providerDataPartial = true
+			}
+			providerAudits = append(providerAudits, a)
+		}
+	}
+
+	totalWorkspaces := len(records)
+	if totalWorkspaces == 0 {
+		totalWorkspaces = auditOut.WorkspaceCount
+	}
+
+	verdict := ""
+	readyForReview := false
+	switch {
+	case auditOut.CVEDataUnavailable || compliancePtr == nil:
+		verdict = "Compliance status indeterminate — CVE data unavailable. Retry shortly or check OSV.dev availability."
+	case *compliancePtr >= 90:
+		verdict = "✓ No action needed — infrastructure is in good shape for review."
+		readyForReview = true
+	case *compliancePtr >= 70:
+		verdict = fmt.Sprintf("⚠ Action required before review — %d critical workspace%s need attention.", criticalWorkspaces, plural(criticalWorkspaces))
+	default:
+		verdict = fmt.Sprintf("✗ Significant vulnerabilities detected — remediation required before the review. %d of %d workspaces have known vulnerabilities.", atRiskWorkspaces, totalWorkspaces)
+	}
+
+	out := map[string]any{
+		"org":                   org,
+		"generated_at":          time.Now().UTC().Format(time.RFC3339),
+		"compliance_score":      compliancePtr,
+		"compliance_verdict":    verdict,
+		"ready_for_review":      readyForReview,
+		"total_workspaces":      totalWorkspaces,
+		"compliant_workspaces":  compliantWorkspaces,
+		"at_risk_workspaces":    atRiskWorkspaces,
+		"critical_workspaces":   criticalWorkspaces,
+		"top_cves":              topCVEs,
+		"remediation_priority":  priorityList,
+		"cve_data_unavailable":  auditOut.CVEDataUnavailable,
+		"provider_data_partial": providerDataPartial,
+		"provider_audits":       providerAudits,
+		"include_providers":     includeProviders,
+	}
+	body, mErr := json.Marshal(out)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(body)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// providerBrief is the compact provider-with-CVEs entry surfaced by
+// complianceSummaryCall when include_providers is enabled. Drops noisy fields
+// like AllCVEs to keep the compliance payload small.
+type providerBrief struct {
+	Name              string `json:"name"`
+	RegistryPath      string `json:"registry_path"`
+	PinnedVersion     string `json:"pinned_version"`
+	LatestVersion     string `json:"latest_version"`
+	CurrentlyAffected int    `json:"currently_affected"`
+	UpgradingFixes    int    `json:"upgrading_fixes"`
 }
 
 // tarGzDir walks dir and returns a gzipped tar archive of every regular file
@@ -6049,6 +6449,18 @@ func Definitions() []ToolDef {
 					"report_format":  map[string]any{"type": "string", "description": "Optional: \"markdown\" (default) or \"text\""},
 				},
 				"required": []string{"org", "results"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_compliance_summary",
+			Description: "Builds an org-wide compliance posture snapshot for security/audit review readiness. Internally fans out _hcp_tf_version_audit (Terraform CVEs across all workspaces) and, when include_providers=\"true\", a top-3-by-resource-count _hcp_tf_provider_audit fan-out for provider CVEs (default off; ~30s when on). Computes a severity-weighted compliance_score (0-100, null when CVE data is unavailable), top_cves rolled up across the org, remediation_priority list sorted by severity → resources → prod-name signal, and a plain-English compliance_verdict (✓ healthy / ⚠ warning / ✗ degraded / indeterminate). Read-only. Returns { org, generated_at, compliance_score, compliance_verdict, ready_for_review, total_workspaces, compliant_workspaces, at_risk_workspaces, critical_workspaces, top_cves[], remediation_priority[], cve_data_unavailable, provider_data_partial, provider_audits[], include_providers }.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":               map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"include_providers": map[string]any{"type": "string", "description": "Optional. \"true\" to add a top-3-by-resource provider_audit fan-out (~30s wall time). Defaults to \"false\" (fast path, version-audit only, ~5s)."},
+				},
+				"required": []string{"org"},
 			},
 		},
 		{
