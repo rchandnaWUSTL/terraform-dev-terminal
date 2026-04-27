@@ -2,7 +2,7 @@
 
 > The AI that handles your Terraform on-call rotation.
 
-[DEMO GIF]
+![tfpilot demo](demo-mini-v2.gif)
 
 ```bash
 brew install tfpilot
