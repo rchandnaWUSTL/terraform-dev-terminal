@@ -1,96 +1,97 @@
 # tfpilot
 
-> Terminal co-pilot for HCP Terraform operations.
+> The AI that handles your Terraform on-call rotation.
 
-![Demo](demo-mini-v2.gif)
+[DEMO GIF]
+
+```bash
+brew install tfpilot
+```
 
 ---
 
 ## What it does
 
-Ask questions about your infra in plain English, from your terminal.
+Ask your infrastructure questions in plain English.
+Get answers, diagnoses, and fixes — without leaving your terminal.
+hcp-tf> are we audit-ready? show me what's vulnerable before tomorrow's security review hcp-tf> something is wrong in prod, help me figure out what happened hcp-tf> is it safe to apply staging-api to prod-api? hcp-tf> what breaks if I change this workspace? hcp-tf> fix the rest
 
-```
-hcp-tf> why did the last run in prod-k8s-apps fail?
-hcp-tf> is there any drift across my workspaces?
-hcp-tf> how does prod compare to staging right now?
-hcp-tf> what's the blast radius if I apply this?
-hcp-tf> should I use a Stack or workspace for multi-region?
-```
 
-Read-only by default. Full audit log. Every action runs under your scoped HCP Terraform identity.
+Read-only by default. Every action runs under your scoped HCP Terraform
+identity. Full audit log at ~/.tfpilot/audit.log.
 
 ---
 
 ## Quickstart
 
-Prerequisites:
-- HCP Terraform account (authenticated via `hcptf login`)
-- GitHub Copilot Enterprise **or** Anthropic API key
-- [hcptf CLI](https://github.com/thrashr888/hcptf-cli/releases) on your PATH
+**Step 1 — Install hcptf** (tfpilot's tool execution layer):
 
-Install hcptf (required — tfpilot uses it as its tool execution layer):
+```bash
+brew install hcptf
+hcptf login
+```
+
+**Step 2 — Install tfpilot:**
+
+```bash
+brew install tfpilot
+```
+
+**Step 3 — Run it:**
+
+```bash
+# Already have GitHub Copilot Enterprise? Zero new API keys.
+tfpilot --org=my-org --workspace=prod-us-east-1 --auth=copilot
+
+# Or with Anthropic API
+export ANTHROPIC_API_KEY=your-key
+tfpilot --org=my-org --workspace=prod-us-east-1
+
+# Or with OpenAI API
+export OPENAI_API_KEY=your-key
+tfpilot --org=my-org --workspace=prod-us-east-1 --auth=openai
+```
+
+---
+
+## Build from source
+
 ```bash
 curl -LO https://github.com/thrashr888/hcptf-cli/releases/download/v0.6.0/hcptf-cli_0.6.0_darwin_arm64.tar.gz
 tar -xzf hcptf-cli_0.6.0_darwin_arm64.tar.gz
 mkdir -p ~/bin && mv hcptf ~/bin/hcptf && chmod +x ~/bin/hcptf
 echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 hcptf login
-```
 
-Build and run:
-```bash
 git clone https://github.com/rchandnaWUSTL/tfpilot.git
 cd tfpilot
 go build -o tfpilot ./cmd/tfpilot
-
-# Already have GitHub Copilot Enterprise? Zero new API keys needed.
-./tfpilot --org=my-org --workspace=prod-us-east-1 --auth=copilot
-
-# Or with Anthropic API
-export ANTHROPIC_API_KEY=your-key
-./tfpilot --org=my-org --workspace=prod-us-east-1
-
-# Watch mode — autonomous compliance: scan, suggest, approve once, execute, report
-./tfpilot --watch --org=my-org --auth=copilot --apply
 ```
 
 ---
 
-## Features
+## What it can do
 
-- Workspace health, drift detection, run history
-- Cross-environment diffs (resources + variables)
-- Risk scoring and blast radius analysis before you apply
-- Error diagnosis with categorized root cause and suggested fix
-- Apply gates that scale with risk level (approval required, double confirmation for destructions)
-- HCP Terraform Stacks support with Stack vs workspace guidance
-- Config generation — describe intent, get valid HCL written to disk
-- Workspace creation and resource provisioning from natural language — describe the workspace and resources, and tfpilot creates, uploads, and queues a run in one step
-- Org-wide Terraform version audit with CVE checking — groups workspaces by version, flags known vulnerabilities (sourced from OSV.dev), scores upgrade complexity
-- Per-workspace module audit — infers Terraform Registry modules from a workspace's resource addresses and surfaces the latest available versions from the public registry
-- Per-workspace provider audit — extracts provider names from workspace state, surfaces latest versions from the public registry, and lists known CVEs from OSV.dev with upgrade notes
-- Safe upgrade preview — generates a speculative plan against the local HCL with a bumped provider version constraint, then synthesizes the speculative plan's risk and blast radius, the CVE delta closed by the upgrade, and breaking changes parsed from upstream GitHub release notes into a concrete go / review / no-go recommendation. Available via the agent ("is it safe to upgrade aws to 5.91.0?") or the `/upgrade <provider> <version>` slash command. Requires `--apply` mode; the speculative run is discarded after analysis.
-- End-to-end vulnerability remediation — scan all workspaces for CVEs, prioritize by risk (severity + resource count + prod-name signal), and upgrade Terraform version with a single approval. Demo flow: "do any of my workspaces have security vulnerabilities?" → "which workspace should I prioritize?" → "fix it" → review the plan analysis → "yes" applies the upgrade. Requires `--apply` mode; plan analysis and the destroy-confirmation gate fire before any apply.
-- Batch vulnerability remediation — say "fix the rest" and tfpilot queues every remaining vulnerable workspace, prioritizes by CVE severity → resource count → prod-name, and walks the queue with a single per-workspace approval gate. Approval options: `yes`, `yes to all`, `skip`, `stop`. High-risk workspaces (>50 resources or destructive last run) auto-pause regardless of "yes to all". Live progress renders as `[N/Total] workspace (1.2.7 → 1.14.9) ✓ applied — LOW risk`. Requires `--apply` mode.
-- Compliance report generation — every batch run automatically writes a CISO-shareable Markdown report to `compliance-report-<timestamp>.md` summarizing CVEs resolved, workspaces upgraded, skipped, and failed. Re-run with `/report` after any batch session.
-- Autonomous compliance mode — one sentence triggers a full org vulnerability scan, prioritized findings, and sequential remediation with approval gates
-- Incident response — org-wide change timeline that fans out across every workspace and flags correlated changes, repeated failures, unexpected destructions, and off-hours activity. Pair it with enriched drift detection to identify the affected workspace and likely root cause, then use one-command run-based rollback (gated through plan analysis + apply confirmation) and an automated Markdown postmortem written to `~/.tfpilot/incidents/`. Demo flow: "something is wrong in prod, help me figure out what happened" → "is it safe to revert?" → "revert and write the report".
-- Workspace dependency mapping — walks each workspace's state file for `terraform_remote_state` data sources to answer "what breaks if I change this?" with the list of downstream consumers and the outputs they read. Available via the agent or `/deps`; supports both single-workspace and org-wide views.
-- Enhanced ownership — surfaces inferred owner (admin team or last modifier), team access list, last modified by, description, and creation/update timestamps for every workspace. Available via the agent ("who owns this?") or `/owner`.
-- Watch mode (`--watch`) — boots silently, scans the org for vulnerable Terraform versions, surfaces a single prioritized suggestion with blast radius (workspaces, resources, destructive changes), and executes the upgrade plan after a single `y`/`n`/`report` approval. Generates a markdown compliance report into `~/.tfpilot/reports/`. `--mode=suggest` (default) requires `--apply`; `--mode=report` is read-only.
-
----
-
-## How it works
-
-tfpilot is a thin agent shell on top of [hcptf](https://github.com/thrashr888/hcptf-cli) by [@thrashr888](https://github.com/thrashr888). The agent (Claude or GPT-4o via Copilot) selects the right tools, calls them against your live HCP Terraform org, and synthesizes a plain-English response. Nothing is mocked — every response reflects real state.
+- **Compliance & security** — org-wide CVE scan across all workspaces,
+  prioritized remediation queue, one-command batch upgrades with approval
+  gates, CISO-shareable compliance report generated automatically
+- **Safe upgrade preview** — speculative plan against bumped provider
+  version, CVE delta, breaking changes from GitHub release notes,
+  concrete go / review / no-go recommendation
+- **Incident response** — org-wide change timeline, correlated failure
+  detection, drift-based root cause analysis, one-command rollback,
+  automated postmortem written to disk
+- **Pre-deploy safety** — cross-environment diffs, blast radius, risk
+  scoring, policy checks, cost delta — before you apply anything
+- **Dependency mapping** — what breaks if I change this workspace?
+- **Workspace provisioning** — describe what you want in plain English,
+  tfpilot creates the workspace, uploads config, and queues the run
+- **Watch mode** — boots silently, scans for vulnerabilities, surfaces
+  prioritized suggestions, executes with a single y/n approval
 
 ---
 
 ## Requirements
 
-- Go 1.23+ (to build from source)
-- hcptf CLI on PATH
 - HCP Terraform account
-- GitHub Copilot Enterprise **or** Anthropic API key (`ANTHROPIC_API_KEY`)
+- GitHub Copilot Enterprise, Anthropic API key, **or** OpenAI API key
