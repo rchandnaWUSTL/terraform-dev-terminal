@@ -50,6 +50,9 @@ go build -o tfpilot ./cmd/tfpilot
 # Or with Anthropic API
 export ANTHROPIC_API_KEY=your-key
 ./tfpilot --org=my-org --workspace=prod-us-east-1
+
+# Watch mode — autonomous compliance: scan, suggest, approve once, execute, report
+./tfpilot --watch --org=my-org --auth=copilot --apply
 ```
 
 ---
@@ -75,6 +78,7 @@ export ANTHROPIC_API_KEY=your-key
 - Incident response — org-wide change timeline that fans out across every workspace and flags correlated changes, repeated failures, unexpected destructions, and off-hours activity. Pair it with enriched drift detection to identify the affected workspace and likely root cause, then use one-command run-based rollback (gated through plan analysis + apply confirmation) and an automated Markdown postmortem written to `~/.tfpilot/incidents/`. Demo flow: "something is wrong in prod, help me figure out what happened" → "is it safe to revert?" → "revert and write the report".
 - Workspace dependency mapping — walks each workspace's state file for `terraform_remote_state` data sources to answer "what breaks if I change this?" with the list of downstream consumers and the outputs they read. Available via the agent or `/deps`; supports both single-workspace and org-wide views.
 - Enhanced ownership — surfaces inferred owner (admin team or last modifier), team access list, last modified by, description, and creation/update timestamps for every workspace. Available via the agent ("who owns this?") or `/owner`.
+- Watch mode (`--watch`) — boots silently, scans the org for vulnerable Terraform versions, surfaces a single prioritized suggestion with blast radius (workspaces, resources, destructive changes), and executes the upgrade plan after a single `y`/`n`/`report` approval. Generates a markdown compliance report into `~/.tfpilot/reports/`. `--mode=suggest` (default) requires `--apply`; `--mode=report` is read-only.
 
 ---
 
