@@ -2220,6 +2220,22 @@ func versionUpgradeCall(ctx context.Context, args map[string]string, timeoutSec 
 		return result
 	}
 
+	// Update the workspace's Terraform version first so HCP Terraform executes
+	// the plan using the target binary. Without this the run fails immediately
+	// because the old version can't satisfy the ~> constraint in the HCL stub.
+	_, werr := fetchHCPTFJSON(ctx, timeoutSec,
+		"workspace", "update",
+		"-org="+org,
+		"-name="+workspace,
+		"-terraform-version="+targetVersion,
+		"-output=json",
+	)
+	if werr != nil {
+		result.Err = werr
+		result.Duration = time.Since(start)
+		return result
+	}
+
 	hcl := fmt.Sprintf("terraform {\n  required_version = \"~> %s\"\n}\n", targetVersion)
 
 	populateArgs := map[string]string{
